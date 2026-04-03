@@ -4,3 +4,5 @@ node_modules/
 *.yaml.bak
 dist/
 .DS_Store
+egress.yaml
+livekit.yaml

@@ -1,0 +1,37 @@
+# livekit.yaml — LiveKit Server Configuration
+# Copy this to livekit.yaml and fill in your values. Never commit livekit.yaml.
+port: 7880
+rtc:
+  tcp_port: 7881
+  udp_port: 7882
+  use_external_ip: true
+  turn_servers:
+    - host: global.relay.metered.ca
+      port: 80
+      protocol: udp
+      username: YOUR_METERED_USERNAME
+      credential: YOUR_METERED_CREDENTIAL
+    - host: global.relay.metered.ca
+      port: 80
+      protocol: tcp
+      username: YOUR_METERED_USERNAME
+      credential: YOUR_METERED_CREDENTIAL
+    - host: global.relay.metered.ca
+      port: 443
+      protocol: tcp
+      username: YOUR_METERED_USERNAME
+      credential: YOUR_METERED_CREDENTIAL
+
+redis:
+  address: redis:6379
+
+keys:
+  YOUR_LIVEKIT_API_KEY: YOUR_LIVEKIT_API_SECRET
+
+room:
+  auto_create: true
+  empty_timeout: 300
+  max_participants: 20
+
+logging:
+  level: info

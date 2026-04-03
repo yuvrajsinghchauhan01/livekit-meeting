@@ -1,0 +1,14 @@
+# egress.yaml — LiveKit Egress Configuration
+# Copy this to egress.yaml and fill in your values. Never commit egress.yaml.
+api_key: YOUR_LIVEKIT_API_KEY
+api_secret: YOUR_LIVEKIT_API_SECRET
+ws_url: ws://livekit:7880
+
+redis:
+  address: redis:6379
+
+s3:
+  access_key: YOUR_AWS_ACCESS_KEY_ID
+  secret: YOUR_AWS_SECRET_ACCESS_KEY
+  region: us-east-1
+  bucket: YOUR_S3_BUCKET_NAME
