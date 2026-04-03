@@ -1,0 +1,39 @@
+services:
+  livekit:
+    image: livekit/livekit-server:latest
+    container_name: livekit-server
+    ports:
+      - "7880:7880"
+      - "7881:7881"
+      - "7882:7882/udp"
+    volumes:
+      - ./livekit.yaml:/etc/livekit.yaml
+    command: --config /etc/livekit.yaml
+    depends_on:
+      - redis
+    restart: unless-stopped
+
+  redis:
+    image: redis:7-alpine
+    container_name: livekit-redis
+    restart: unless-stopped
+
+
+  egress:
+    image: livekit/egress:latest
+    container_name: livekit-egress
+    environment:
+      - EGRESS_CONFIG_FILE=/etc/egress.yaml
+    volumes:
+      - ./egress.yaml:/etc/egress.yaml
+    cap_add:
+      - SYS_ADMIN
+    depends_on:
+      - livekit
+      - redis
+    restart: unless-stopped
+    shm_size: "1gb"
+
+networks:
+  default:
+    name: livekit-network

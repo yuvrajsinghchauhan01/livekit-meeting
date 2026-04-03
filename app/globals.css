@@ -1,0 +1,24 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+/* Override LiveKit component styles to match our dark theme */
+:root {
+  --lk-bg: #0f172a;
+  --lk-bg2: #1e293b;
+  --lk-border: #334155;
+}
+
+body {
+  background-color: #0f172a;
+  color: #f1f5f9;
+}
+
+/* Recording pulse indicator */
+@keyframes recordPulse {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.3; }
+}
+.record-pulse {
+  animation: recordPulse 1.5s ease-in-out infinite;
+}

@@ -1,0 +1,6 @@
+node_modules/
+.next/
+.env.local
+*.yaml.bak
+dist/
+.DS_Store

@@ -1,0 +1,291 @@
+# =========================
+# MUST BE FIRST
+# =========================
+import eventlet
+eventlet.monkey_patch()
+
+from pythonosc.dispatcher import Dispatcher
+from pythonosc.osc_server import BlockingOSCUDPServer
+import socketio
+import numpy as np
+import time
+import os
+
+# =========================
+# CONFIGURATION
+# =========================
+OSC_PORT_CAM1    = 3333      # ReacTIVision instance for Pi Camera 1
+OSC_PORT_CAM2    = 4444      # ReacTIVision instance for Pi Camera 2
+SOCKET_PORT      = 3335      # Socket.IO port (Unreal Engine / frontend)
+
+# Combined projector resolution (both projectors side by side)
+# PROJECTOR_WIDTH  = 3840
+# PROJECTOR_HEIGHT = 1080
+PROJECTOR_WIDTH = 1920
+PROJECTOR_HEIGHT = 1080
+# Pi camera capture resolution (must match reacTIVision camera settings)
+CAMERA_WIDTH     = 1280
+CAMERA_HEIGHT    = 720
+
+# Path to the NPZ calibration file.
+# Generate this file using your calibration script, then update the path here.
+# Keys expected inside the file:  "H1"  (cam1 → projector)
+#                                  "H2"  (cam2 → projector)
+NPZ_CALIBRATION_PATH = r"C:\Users\NoorAlam\Desktop\28.03.26\New folder\homography_calibration_3cam_recalibrated_20260401_223150.npz"
+
+# Homography matrix auto-reload interval in seconds (default: every hour)
+HOMOGRAPHY_RELOAD_INTERVAL = 3600
+
+# Tag 9 is reserved as a touch/pointer input — not rendered as a HUD marker.
+# A 100 ms debounce prevents event flooding.
+TOUCH_TAG_ID     = 9
+last_touch_time  = 0
+
+# =========================
+# ALIVE TRACKING
+# Per-camera alive sets are merged before emitting to the frontend.
+# =========================
+alive_cam1 = set()
+alive_cam2 = set()
+
+# =========================
+# SOCKET.IO SETUP
+# =========================
+sio = socketio.Server(cors_allowed_origins="*")
+app = socketio.WSGIApp(sio)
+
+@sio.event
+def connect(sid, environ):
+    print(f"[SOCKET] Client connected    : {sid}")
+
+@sio.event
+def disconnect(sid):
+    print(f"[SOCKET] Client disconnected : {sid}")
+
+# =========================
+# HOMOGRAPHY MANAGER
+# Loads H1 and H2 from the NPZ file and applies them per-camera.
+# Falls back to raw projector scaling if the file is missing/corrupt.
+# =========================
+class HomographyManager:
+    def __init__(self, path, reload_interval=HOMOGRAPHY_RELOAD_INTERVAL):
+        self.path            = path
+        self.reload_interval = reload_interval
+        self.last_load       = 0
+        self.H2              = None   # cam1 → projector
+        self.H3              = None   # cam2 → projector
+        self.calibrated      = False
+        self._load()
+
+    def _load(self):
+        if not os.path.exists(self.path):
+            print(f"[WARN]  NPZ file not found : {self.path}")
+            print(f"[WARN]  Running in RAW mode — coords = TUIO * projector resolution")
+            self.H2 = self.H3 = None
+            self.calibrated = False
+            return
+        try:
+            data            = np.load(self.path)
+            self.H2         = data["H2"]
+            # self.H2         = data["H2"]
+
+            self.H3         = data["H3"]
+            self.last_load  = time.time()
+            self.calibrated = True
+            print(f"[OK]  Homography loaded from : {self.path}")
+            print(f"[OK]  H1 (cam1) and H2 (cam2) matrices ready")
+        except Exception as e:
+            print(f"[ERROR] Failed to load NPZ : {e}")
+            print(f"[WARN]  Running in RAW mode — coords = TUIO * projector resolution")
+            self.H2 = self.H3 = None
+            self.calibrated = False
+
+    def maybe_reload(self):
+        """Auto-reload the NPZ file if the reload interval has elapsed."""
+        if time.time() - self.last_load > self.reload_interval:
+            print(f"[INFO]  Reloading homography matrices...")
+            self._load()
+
+    def _apply(self, H, cam_x, cam_y):
+        """Apply a 3x3 homography matrix to a camera pixel coordinate."""
+        p = np.array([cam_x, cam_y, 1.0])
+        q = H @ p
+        q /= q[2]
+        return float(q[0]), float(q[1])
+
+    def transform_cam1(self, norm_x, norm_y):
+        """
+        Convert normalised TUIO coords (0-1) from cam1 to projector pixels.
+        Uses H1 if calibrated, otherwise falls back to raw scaling.
+        """
+        self.maybe_reload()
+        if self.H2 is not None:
+            cam_x = norm_x * CAMERA_WIDTH
+            cam_y = norm_y * CAMERA_HEIGHT
+            return self._apply(self.H2, cam_x, cam_y)
+        # --- RAW fallback ---
+        return norm_x * PROJECTOR_WIDTH, norm_y * PROJECTOR_HEIGHT
+
+    def transform_cam2(self, norm_x, norm_y):
+        """
+        Convert normalised TUIO coords (0-1) from cam2 to projector pixels.
+        Uses H2 if calibrated, otherwise falls back to raw scaling.
+        """
+        self.maybe_reload()
+        if self.H3 is not None:
+            cam_x = norm_x * CAMERA_WIDTH
+            cam_y = norm_y * CAMERA_HEIGHT
+            return self._apply(self.H3, cam_x, cam_y)
+        # --- RAW fallback ---
+        return norm_x * PROJECTOR_WIDTH, norm_y * PROJECTOR_HEIGHT
+
+
+
+homography = HomographyManager(NPZ_CALIBRATION_PATH)
+
+# =========================
+# HELPERS
+# =========================
+def emit_merged_alive():
+    """Merge both cameras' alive sets and push to frontend."""
+    merged = list(alive_cam1 | alive_cam2)
+    sio.emit("alive", {"ids": merged})
+
+def handle_set(tag_id, norm_x, norm_y, angle, cam_label):
+    """
+    Shared SET logic for both cameras.
+    - Applies homography (or raw fallback) to get projector pixel coords.
+    - Tag 9 → emits 'touch' event with debounce.
+    - All other tags → emits 'tag' event.
+    """
+    global last_touch_time
+
+    # --- Coordinate transform ---
+    if cam_label == "cam1":
+        pixel_x, pixel_y = homography.transform_cam1(norm_x, norm_y)
+    else:
+        pixel_x, pixel_y = homography.transform_cam2(norm_x, norm_y)
+
+    # --- Tag 9: touch / pointer event ---
+    if tag_id == TOUCH_TAG_ID:
+        now = time.time()
+        if now - last_touch_time > 0.1:
+            sio.emit("touch", {"x": pixel_x, "y": pixel_y, "source": cam_label})
+            last_touch_time = now
+            print(f"[TOUCH]  Tag 9 @ ({pixel_x:.0f}, {pixel_y:.0f})  source={cam_label}")
+        else:
+            print(f"[TOUCH]  Tag 9 @ ({pixel_x:.0f}, {pixel_y:.0f})  debounced — skipped")
+        return  # Do NOT emit a regular "tag" for Tag 9
+
+    # --- Out-of-bounds guard (only relevant when calibrated) ---
+    if homography.calibrated:
+        if not (0 <= pixel_x <= PROJECTOR_WIDTH and 0 <= pixel_y <= PROJECTOR_HEIGHT):
+            print(f"[SKIP]   id={tag_id}  out of projector bounds ({pixel_x:.0f}, {pixel_y:.0f})")
+            return
+
+    # --- Standard marker ---
+    print(f"[TAG]    id={tag_id}  pixel=({pixel_x:.0f}, {pixel_y:.0f})  angle={angle:.3f}  source={cam_label}")
+    sio.emit("tag", {"id": tag_id, "x": pixel_x, "y": pixel_y, "angle": angle, "source": cam_label})
+
+# =========================
+# OSC HANDLERS
+# =========================
+def tuio_handler_cam1(address, *args):
+    global alive_cam1
+    if not args: return
+    msg_type = args[0]
+
+    if msg_type == "alive":
+        ids = [i for i in args[1:] if i != TOUCH_TAG_ID]
+        alive_cam1 = set(ids)
+        emit_merged_alive()
+        print(f"[ALIVE]  cam1 → {ids}")
+
+    elif msg_type == "set":
+        tag_id            = args[2]
+        norm_x, norm_y    = args[3], args[4]
+        angle             = args[5]
+        alive_cam1.add(tag_id)
+        handle_set(tag_id, norm_x, norm_y, angle, "cam1")
+
+    elif msg_type == "fseq":
+        frame_seq = args[1] if len(args) > 1 else "?"
+        print(f"[FSEQ]   cam1  frame={frame_seq}")
+
+
+
+def tuio_handler_cam2(address, *args):
+    global alive_cam2
+    if not args: return
+    msg_type = args[0]
+
+    if msg_type == "alive":
+        ids = [i for i in args[1:] if i != TOUCH_TAG_ID]
+        alive_cam2 = set(ids)
+        emit_merged_alive()
+        print(f"[ALIVE]  cam2 → {ids}")
+
+    elif msg_type == "set":
+        tag_id            = args[2]
+        norm_x, norm_y    = args[3], args[4]
+        angle             = args[5]
+        alive_cam2.add(tag_id)
+        handle_set(tag_id, norm_x, norm_y, angle, "cam2")
+
+    elif msg_type == "fseq":
+        frame_seq = args[1] if len(args) > 1 else "?"
+        print(f"[FSEQ]   cam2  frame={frame_seq}")
+
+# =========================
+# OSC SERVER RUNNER
+# =========================
+def start_osc(port, handler, label):
+    dispatcher = Dispatcher()
+    dispatcher.map("/tuio/2Dobj", handler)
+
+    try:
+        server = BlockingOSCUDPServer(("0.0.0.0", port), dispatcher)
+        server.timeout = 0.01
+        print(f"[OK]  OSC {label} listening on UDP port {port}")
+    except OSError as e:
+        print(f"[ERROR] Cannot bind OSC port {port} ({label}): {e}")
+        print(f"        Close any other running bridge and retry.")
+        raise SystemExit(1)
+
+    while True:
+        server.handle_request()
+        eventlet.sleep(0)
+
+# =========================
+# START
+# =========================
+if __name__ == "__main__":
+    print("=" * 55)
+    print("  DUAL PI CAMERA BRIDGE  --  starting up")
+    print("=" * 55)
+
+    # Bind Socket.IO port first so we fail fast if it's taken
+    try:
+        socket_listener = eventlet.listen(("0.0.0.0", SOCKET_PORT))
+        print(f"[OK]  Socket.IO listening on port {SOCKET_PORT}  (Unreal Engine / frontend)")
+    except OSError as e:
+        print(f"[ERROR] Cannot bind Socket.IO port {SOCKET_PORT}: {e}")
+        raise SystemExit(1)
+
+    mode = "CALIBRATED (homography)" if homography.calibrated else "RAW (no NPZ file)"
+    print(f"[OK]  Coordinate mode      : {mode}")
+    print(f"[OK]  Camera resolution    : {CAMERA_WIDTH} x {CAMERA_HEIGHT}")
+    print(f"[OK]  Projector resolution : {PROJECTOR_WIDTH} x {PROJECTOR_HEIGHT}")
+    print(f"[OK]  Tag {TOUCH_TAG_ID} reserved as touch pointer  (100 ms debounce)")
+    print("-" * 55)
+
+    # Spawn both OSC listeners as eventlet greenthreads
+    eventlet.spawn(start_osc, OSC_PORT_CAM1, tuio_handler_cam1, "cam1")
+    eventlet.spawn(start_osc, OSC_PORT_CAM2, tuio_handler_cam2, "cam2")
+
+    print("  Waiting for reacTIVision data from both Pi cameras...")
+    print("  [FSEQ] lines will appear once tags are detected.")
+    print("-" * 55)
+
+    eventlet.wsgi.server(socket_listener, app)
+Message Deep Kothari
