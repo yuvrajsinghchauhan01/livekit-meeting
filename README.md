@@ -1,169 +1,133 @@
 # LiveKit Meeting App
 
-A full-featured video meeting application with **per-participant recording to S3**, built with Next.js 14, LiveKit, and Docker.
-
-## Architecture
-
-```
-Browser (Next.js)
-    │
-    ├── /api/auth/login     → validates APP_PASSWORD, issues app JWT
-    ├── /api/token          → issues LiveKit room token (JWT-protected)
-    ├── /api/egress/start   → starts ParticipantEgress (JWT-protected)
-    └── /api/egress/stop    → stops egress by ID (JWT-protected)
-
-Docker Compose
-    ├── livekit-server      → ws://localhost:7880
-    ├── redis               → session/room state
-    └── livekit-egress      → records tracks → uploads to S3
-
-TURN (Media Relay)
-    └── Metered.ca hosted TURN → global.relay.metered.ca
-        (handles UDP/TCP media relay for guests behind NAT/firewall)
-```
-
-### S3 Recording Path Structure
-```
-livekit-recordings-yuvraj/
-└── recordings/
-    └── <meeting-name>/
-        ├── Alice.mp4
-        ├── Bob.mp4
-        └── Charlie.mp4
-```
+Self-hosted video meeting app with per-participant audio recording to S3. Built with Next.js 14, LiveKit, and Docker.
 
 ---
 
-## How Networking Works (Local Dev with ngrok)
+## Stack
 
-This app runs locally on a Mac and is exposed to the internet via two ngrok tunnels:
+- **Next.js 14** — frontend + API routes
+- **LiveKit** (self-hosted) — WebRTC signaling and media server
+- **LiveKit Egress** — records each participant's audio track as `.ogg` → uploads to S3
+- **Redis** — LiveKit session/room state
+- **Metered.ca TURN** — hosted TURN relay so guests behind NAT/firewall can connect
+- **AWS S3** — stores recordings
+
+---
+
+## How It Works
+
+Two ngrok tunnels expose the app to the internet from your Mac:
 
 | Tunnel | Port | Purpose |
 |---|---|---|
-| ngrok #1 | 3000 | Next.js app (share this URL with guests) |
+| ngrok #1 | 3000 | Next.js app — share this URL with guests |
 | ngrok #2 | 7880 | LiveKit signaling (WebSocket) |
 
-**Why two tunnels?**
-- Port 3000 serves the web app
-- Port 7880 is the LiveKit WebSocket signaling endpoint — guests need to reach it directly
+Media (audio/video) flows through Metered.ca's hosted TURN servers — no UDP ports need to be exposed locally.
 
-**Why not more tunnels?**
-Previously a local coturn TURN server was used, which required exposing UDP ports (7881, 7882, 3478, 49152-49200). ngrok doesn't support UDP, so media would fail after a few seconds.
+Recording flow:
+1. Participant joins → mic track is published
+2. Backend starts a LiveKit TrackEgress for that participant
+3. On leave → egress stops, `.ogg` file is finalized and uploaded to S3
+4. A `.json` metadata file is written alongside each recording
 
-**Current fix:** Metered.ca hosted TURN handles all media relay. No UDP ports need to be exposed locally. The two ngrok tunnels (3000 + 7880) are sufficient.
+S3 path structure:
+```
+<bucket>/
+└── recordings/
+    └── <room-name>/
+        └── <stable-identity>/
+            ├── TR_<trackSid>.ogg
+            └── EG_<trackSid>.json
+```
 
-### Starting ngrok
+> Participant identity is a stable hash of `username:roomName` — so reconnects and display name changes don't create duplicate folders.
 
-Run these in two separate terminals:
+---
+
+## Setup
+
+### 1. Prerequisites
+
+- Docker + Docker Compose
+- Node.js 18+
+- AWS S3 bucket
+- Two ngrok tunnels running
+- Metered.ca account (free tier) for TURN credentials
+
+### 2. Config files
+
+These files are gitignored and must be created locally. Use the `.example` files as templates:
+
+```bash
+cp egress.yaml.example egress.yaml
+cp livekit.yaml.example livekit.yaml
+```
+
+Fill in `egress.yaml`:
+- `api_key` / `api_secret` — must match `livekit.yaml` and `.env.local`
+- `s3.access_key` / `s3.secret` — AWS IAM credentials
+- `s3.region` / `s3.bucket` — your S3 bucket details
+
+Fill in `livekit.yaml`:
+- `keys` — your API key/secret pair
+- `turn_servers` — Metered.ca username and credential
+
+### 3. Environment variables
+
+Create `.env.local`:
+
+```env
+LIVEKIT_URL=ws://localhost:7880
+LIVEKIT_API_KEY=your_api_key
+LIVEKIT_API_SECRET=your_api_secret
+JWT_SECRET=your_jwt_secret
+APP_PASSWORD=your_app_password
+AWS_ACCESS_KEY_ID=your_aws_key
+AWS_SECRET_ACCESS_KEY=your_aws_secret
+AWS_REGION=us-east-1
+S3_BUCKET=your_bucket_name
+NEXT_PUBLIC_LIVEKIT_URL=wss://your-ngrok-7880-url
+```
+
+Generate secrets:
+```bash
+openssl rand -hex 32   # use for LIVEKIT_API_SECRET and JWT_SECRET
+```
+
+### 4. Start Docker stack
+
+```bash
+docker compose up -d
+docker compose ps      # verify all 3 containers are running
+```
+
+Containers: `livekit-server`, `livekit-redis`, `livekit-egress`
+
+### 5. Start ngrok (two terminals)
 
 ```bash
 ngrok http 3000
 ngrok http 7880
 ```
 
-Then update `.env.local`:
-```
-NEXT_PUBLIC_LIVEKIT_URL=wss://<your-7880-ngrok-url>
-```
+Update `NEXT_PUBLIC_LIVEKIT_URL` in `.env.local` with the `wss://` ngrok URL for port 7880 each time it changes.
 
-And share the `https://<your-3000-ngrok-url>` with guests.
-
----
-
-## Quick Start
-
-### 1. Prerequisites
-
-- Docker & Docker Compose
-- Node.js 18+
-- AWS S3 bucket named `livekit-recordings-yuvraj`
-- Two ngrok tunnels (see above)
-
-### 2. Configure environment
-
-Edit `.env.local`:
-
-| Variable | What to set |
-|---|---|
-| `LIVEKIT_URL` | `ws://localhost:7880` (server-side, stays local) |
-| `NEXT_PUBLIC_LIVEKIT_URL` | `wss://<ngrok-7880-url>` (browser-facing) |
-| `LIVEKIT_API_KEY` | Must match `livekit.yaml` → `keys:` key name |
-| `LIVEKIT_API_SECRET` | Must match `livekit.yaml` → `keys:` secret value |
-| `JWT_SECRET` | Any random 32+ char string — `openssl rand -hex 32` |
-| `APP_PASSWORD` | Password users enter to log in |
-| `AWS_ACCESS_KEY_ID` | AWS IAM key with S3 write access |
-| `AWS_SECRET_ACCESS_KEY` | Corresponding secret |
-| `AWS_REGION` | e.g. `us-east-1` |
-| `S3_BUCKET` | `livekit-recordings-yuvraj` |
-
-Also update **`livekit.yaml`** and **`egress.yaml`** with the same `api_key` / `api_secret` values.
-
-### 3. Start LiveKit stack
-
-```bash
-docker compose up -d
-```
-
-Verify containers are running:
-```bash
-docker compose ps
-docker compose logs livekit
-docker compose logs egress
-```
-
-### 4. Install & run Next.js app
+### 6. Run the app
 
 ```bash
 npm install
 npm run dev
 ```
 
-Open [http://localhost:3000](http://localhost:3000)
+Open [http://localhost:3000](http://localhost:3000) or share the ngrok 3000 URL with guests.
 
 ---
 
-## Using the App
+## AWS IAM Policy
 
-1. **Login** — enter any username + the `APP_PASSWORD` from `.env.local`
-2. **Create/join room** — type a room name and your display name
-3. **Meeting room** — your camera/mic activate automatically
-4. **Start Recording** — click **"Record My Track"** in the top bar
-5. **Stop Recording** — click **"Stop Recording"** — `.mp4` is uploaded to S3
-6. **Leave** — click **"Leave"**
-
-> Each participant controls their own recording. Multiple participants can record simultaneously — each gets their own `.mp4` in S3.
-
----
-
-## TURN Configuration (Metered.ca)
-
-Media relay is handled by [Metered.ca](https://www.metered.ca/stun-turn) hosted TURN servers. This is configured in `livekit.yaml`:
-
-```yaml
-rtc:
-  turn_servers:
-    - host: global.relay.metered.ca
-      port: 80
-      protocol: udp
-      username: <metered-username>
-      credential: <metered-credential>
-    - host: global.relay.metered.ca
-      port: 80
-      protocol: tcp
-      username: <metered-username>
-      credential: <metered-credential>
-    - host: global.relay.metered.ca
-      port: 443
-      protocol: tcp
-      username: <metered-username>
-      credential: <metered-credential>
-```
-
-If you need to replace the TURN credentials, sign in to [metered.ca](https://www.metered.ca), go to your app's TURN Credentials page, and update the `username` and `credential` fields in `livekit.yaml`.
-
----
-
-## S3 IAM Permissions
+The IAM user needs this policy on your S3 bucket:
 
 ```json
 {
@@ -171,15 +135,10 @@ If you need to replace the TURN credentials, sign in to [metered.ca](https://www
   "Statement": [
     {
       "Effect": "Allow",
-      "Action": [
-        "s3:PutObject",
-        "s3:PutObjectAcl",
-        "s3:GetObject",
-        "s3:ListBucket"
-      ],
+      "Action": ["s3:PutObject", "s3:PutObjectAcl", "s3:GetObject", "s3:ListBucket"],
       "Resource": [
-        "arn:aws:s3:::livekit-recordings-yuvraj",
-        "arn:aws:s3:::livekit-recordings-yuvraj/*"
+        "arn:aws:s3:::your-bucket-name",
+        "arn:aws:s3:::your-bucket-name/*"
       ]
     }
   ]
@@ -188,42 +147,11 @@ If you need to replace the TURN credentials, sign in to [metered.ca](https://www
 
 ---
 
-## File Structure
+## Security Notes
 
-```
-livekit-meeting/
-├── docker-compose.yml          # LiveKit + Redis + Egress
-├── livekit.yaml                # LiveKit server config (incl. Metered TURN)
-├── egress.yaml                 # Egress config (S3 creds)
-├── .env.local                  # App secrets (never commit!)
-│
-├── app/
-│   ├── layout.tsx
-│   ├── page.tsx                # Login + lobby
-│   ├── globals.css
-│   └── api/
-│       ├── auth/login/route.ts
-│       ├── token/route.ts
-│       └── egress/
-│           ├── start/route.ts
-│           └── stop/route.ts
-│
-├── components/
-│   ├── MeetingRoom.tsx
-│   └── RecordingControls.tsx
-│
-└── lib/
-    ├── auth.ts
-    └── livekit.ts
-```
-
----
-
-## Generating Secrets
-
-```bash
-openssl rand -hex 32   # for LIVEKIT_API_SECRET and JWT_SECRET
-```
+- `egress.yaml`, `livekit.yaml`, and `.env.local` are all gitignored — never commit them
+- Use `.example` files to share config structure without secrets
+- If secrets are ever accidentally pushed, rotate them immediately in AWS IAM / Metered dashboard
 
 ---
 
@@ -231,10 +159,10 @@ openssl rand -hex 32   # for LIVEKIT_API_SECRET and JWT_SECRET
 
 | Problem | Fix |
 |---|---|
-| Guest sees gray/black screen then gets kicked | TURN is not working — verify Metered credentials in `livekit.yaml` |
-| Egress container exits immediately | Check `shm_size: "1gb"` and `cap_add: SYS_ADMIN` in docker-compose.yml |
-| `Failed to start recording` | Ensure egress container is running and `LIVEKIT_URL` is `ws://localhost:7880` |
+| Guest sees gray/black screen then disconnects | TURN not working — verify Metered credentials in `livekit.yaml` |
+| Multiple `.ogg` / `.json` files per person | Fixed — egress deduplication is handled server-side |
 | Recording not in S3 | Check AWS credentials in `egress.yaml` and IAM permissions |
-| `Invalid credentials` on login | Check `APP_PASSWORD` in `.env.local` |
-| Can't join room | Verify `LIVEKIT_API_KEY` / `LIVEKIT_API_SECRET` match between `livekit.yaml` and `.env.local` |
+| `Failed to start recording` | Ensure `livekit-egress` container is running |
+| Can't join room | Verify `LIVEKIT_API_KEY` / `LIVEKIT_API_SECRET` match across `livekit.yaml`, `egress.yaml`, and `.env.local` |
 | ngrok URL changed | Update `NEXT_PUBLIC_LIVEKIT_URL` in `.env.local` and restart `npm run dev` |
+| GitHub push blocked — secret detected | Check git history with `git log` — secrets in old commits need history rewrite, not just `.gitignore` |
