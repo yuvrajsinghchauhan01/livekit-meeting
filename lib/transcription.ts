@@ -32,6 +32,13 @@ const VAD_MIN_SILENCE_SECONDS = Number(
 const VAD_MIN_SPEECH_MS = Number(process.env.VAD_MIN_SPEECH_MS || "400");
 const VAD_PADDING_MS = Number(process.env.VAD_PADDING_MS || "200");
 const VAD_MERGE_GAP_MS = Number(process.env.VAD_MERGE_GAP_MS || "700");
+const NOISE_MIN_CONFIDENCE = Number(
+  process.env.NOISE_MIN_CONFIDENCE || "0.52"
+);
+const NOISE_MAX_DURATION_MS = Number(
+  process.env.NOISE_MAX_DURATION_MS || "2200"
+);
+const NOISE_MAX_CHARS = Number(process.env.NOISE_MAX_CHARS || "12");
 const TRANSCRIPTION_HINTS = process.env.OPENAI_TRANSCRIPTION_HINTS || "";
 
 const roomJobs = new Map<string, Promise<TranscriptionRunResult>>();
@@ -1218,6 +1225,60 @@ function mergeAdjacentUtterances(utterances: TrackUtterance[]) {
   return merged;
 }
 
+function normalizeNoiseText(text: string) {
+  return text
+    .toLowerCase()
+    .replace(/[^a-z0-9\u0600-\u06ff\u0750-\u077f\u08a0-\u08ff\u0900-\u097f\s]/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function isRepeatedTokenPhrase(normalizedText: string) {
+  const tokens = normalizedText.split(" ").filter(Boolean);
+  if (tokens.length === 0 || tokens.length > 4) return false;
+  return tokens.every((token) => token === tokens[0]);
+}
+
+function isLikelyNoiseUtterance(utterance: TrackUtterance) {
+  const confidence =
+    typeof utterance.confidence === "number" ? utterance.confidence : 1;
+  if (confidence >= NOISE_MIN_CONFIDENCE) return false;
+
+  const normalizedText = normalizeNoiseText(utterance.original_text);
+  const durationMs = Math.max(0, utterance.end_ms - utterance.start_ms);
+  const shortText = normalizedText.length > 0 && normalizedText.length <= NOISE_MAX_CHARS;
+  const shortDuration = durationMs <= NOISE_MAX_DURATION_MS;
+
+  const fillerTerms = new Set([
+    "you",
+    "bye",
+    "yeah",
+    "okay",
+    "ok",
+    "shh",
+    "hmm",
+    "um",
+    "uh",
+    "hello",
+    "hi",
+    "peace",
+  ]);
+
+  const tokens = normalizedText.split(" ").filter(Boolean);
+  const onlyFiller =
+    tokens.length > 0 && tokens.every((token) => fillerTerms.has(token));
+
+  if (!shortDuration) return false;
+  if (onlyFiller) return true;
+  if (shortText && isRepeatedTokenPhrase(normalizedText)) return true;
+  if (shortText && tokens.length <= 2) return true;
+  return false;
+}
+
+function filterNoiseUtterances(utterances: TrackUtterance[]) {
+  return utterances.filter((utterance) => !isLikelyNoiseUtterance(utterance));
+}
+
 async function createTrackTranscript(track: TrackDescriptor): Promise<TrackTranscriptArtifact> {
   const s3 = getS3Client();
   const audioBuffer = await readBinaryObject(s3, track.audioFileKey);
@@ -1251,7 +1312,9 @@ async function createTrackTranscript(track: TrackDescriptor): Promise<TrackTrans
     chunkUtterances.push(...utterancesForChunk);
   }
 
-  const utterances = mergeAdjacentUtterances(chunkUtterances);
+  const utterances = filterNoiseUtterances(
+    mergeAdjacentUtterances(chunkUtterances)
+  );
   const translations = await translateUtterances(
     utterances.map((utterance) => ({
       original_text: utterance.original_text,
@@ -1259,22 +1322,24 @@ async function createTrackTranscript(track: TrackDescriptor): Promise<TrackTrans
     }))
   );
 
-  const hydratedUtterances = utterances.map((utterance, index) => {
-    const translation = translations.get(index);
-    const englishText = translation?.english_text || utterance.original_text;
-    const inferredLanguage =
-      translation?.language && ["en", "hi", "mixed", "unknown"].includes(translation.language)
-        ? translation.language
-        : inferMeetingLanguageLabel(utterance.original_text, englishText);
+  const hydratedUtterances = filterNoiseUtterances(
+    utterances.map((utterance, index) => {
+      const translation = translations.get(index);
+      const englishText = translation?.english_text || utterance.original_text;
+      const inferredLanguage =
+        translation?.language && ["en", "hi", "mixed", "unknown"].includes(translation.language)
+          ? translation.language
+          : inferMeetingLanguageLabel(utterance.original_text, englishText);
 
-    return {
-      ...utterance,
-      language: inferredLanguage === "unknown"
-        ? inferMeetingLanguageLabel(utterance.original_text, englishText)
-        : inferredLanguage,
-      english_text: englishText,
-    };
-  });
+      return {
+        ...utterance,
+        language: inferredLanguage === "unknown"
+          ? inferMeetingLanguageLabel(utterance.original_text, englishText)
+          : inferredLanguage,
+        english_text: englishText,
+      };
+    })
+  );
 
   return {
     room_name: track.roomName,

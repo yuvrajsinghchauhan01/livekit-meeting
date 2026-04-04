@@ -1,6 +1,6 @@
 # LiveKit Meeting App
 
-Self-hosted video meetings with automatic per-participant audio recording, S3 storage, and OpenAI-powered transcription. Built with Next.js 14, LiveKit, and Docker.
+Self-hosted video meetings with automatic per-participant audio recording, canonical participant audio in S3, and OpenAI-powered transcription. Built with Next.js 14, LiveKit, and Docker.
 
 ---
 
@@ -12,6 +12,7 @@ Self-hosted video meetings with automatic per-participant audio recording, S3 st
 - Redis — LiveKit session/room state
 - Metered.ca TURN — hosted TURN relay for guests behind NAT/firewall
 - AWS S3 — stores recordings and transcripts
+- ffmpeg — canonical audio merge, preprocessing, and VAD-style speech window detection
 - OpenAI Whisper — audio transcription
 - GPT-4o-mini — translation and language detection
 
@@ -31,13 +32,21 @@ Media flows through Metered.ca TURN servers — no UDP ports need to be opened l
 Recording flow:
 1. Participant joins → mic track is published
 2. Backend starts a LiveKit TrackEgress for that participant
-3. On leave → egress stops, `.ogg` is finalized and uploaded to S3
-4. A `.json` metadata file is written alongside each recording
+3. On leave → egress stops, raw `.ogg` fragments and metadata are finalized in S3
+4. Raw fragments are grouped by stable participant identity and merged into one canonical `audio.ogg`
+5. One canonical `metadata.json` is written per participant
 
 Transcription flow:
-1. Audio is chunked into ~45s segments and sent to OpenAI Whisper
-2. Utterances are translated to English via GPT-4o-mini (batched, 50 at a time)
-3. A merged meeting transcript and manifest are written to S3
+1. Canonical participant audio is normalized with `ffmpeg`
+2. VAD-style speech windows are detected with `ffmpeg silencedetect`
+3. Only voiced windows are chunked into ~45s segments and sent to OpenAI Whisper
+4. Utterances are translated to English via GPT-4o-mini (batched, 50 at a time)
+5. A merged meeting transcript and manifest are written to S3
+
+Important storage note:
+- `TR_*`, `EG_*`, and `APP_*` files are raw/internal artifacts used for bookkeeping and canonicalization
+- the user-facing participant outputs are `audio.ogg` and `metadata.json`
+- the user-facing room transcript outputs live under `_transcripts/`
 
 S3 storage layout:
 ```
@@ -45,6 +54,9 @@ S3 storage layout:
 └── recordings/
     └── <room-name>/
         ├── <participant-identity>/
+        │   ├── TR_<trackSid>.ogg    ← raw fragment input
+        │   ├── EG_<trackSid>.json   ← raw egress metadata
+        │   ├── APP_<trackSid>.json  ← app metadata for speaker mapping
         │   ├── audio.ogg          ← canonical merged audio
         │   └── metadata.json      ← canonical participant metadata
         └── _transcripts/
@@ -103,6 +115,19 @@ NEXT_PUBLIC_LIVEKIT_URL=wss://your-ngrok-7880-url
 
 OPENAI_API_KEY=your_openai_key
 OPENAI_TRANSCRIPTION_MODEL=whisper-1
+OPENAI_TRANSLATION_MODEL=gpt-4o-mini
+
+# Optional transcription tuning
+WHISPER_CHUNK_SECONDS=45
+VAD_SILENCE_NOISE=-35dB
+VAD_MIN_SILENCE_SECONDS=0.6
+VAD_MIN_SPEECH_MS=400
+VAD_PADDING_MS=200
+VAD_MERGE_GAP_MS=700
+NOISE_MIN_CONFIDENCE=0.52
+NOISE_MAX_DURATION_MS=2200
+NOISE_MAX_CHARS=12
+OPENAI_TRANSCRIPTION_HINTS=
 ```
 
 Generate secrets:
@@ -172,6 +197,32 @@ The IAM user needs this policy on your S3 bucket:
 
 ---
 
+## Transcript Outputs
+
+Canonical participant files:
+- `recordings/<room-name>/<participant-identity>/audio.ogg`
+- `recordings/<room-name>/<participant-identity>/metadata.json`
+
+Room transcript files:
+- `recordings/<room-name>/_transcripts/meeting_transcript.en.json`
+- `recordings/<room-name>/_transcripts/manifest.json`
+
+`meeting_transcript.en.json` includes:
+- `speakers` with stable `identity` and `display_name`
+- `utterances` with `speaker_name`, `speaker_identity`, `start_ms`, `end_ms`, `original_text`, and `english_text`
+- `full_english_transcript` for a quick merged readout
+
+To rerun transcription for an already-recorded room:
+
+```bash
+curl -X POST http://localhost:3000/api/transcription/run \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer <app-jwt>" \
+  -d '{"roomName":"meet-xxxx-yyyy","force":true}'
+```
+
+---
+
 ## Security Notes
 
 - `egress.yaml`, `livekit.yaml`, and `.env.local` are gitignored — never commit them
@@ -187,6 +238,7 @@ The IAM user needs this policy on your S3 bucket:
 | Guest sees black screen then disconnects | TURN not working — verify Metered credentials in `livekit.yaml` |
 | Recording not in S3 | Check AWS credentials in `egress.yaml` and IAM permissions |
 | `Failed to start recording` | Ensure `livekit-egress` container is running |
+| Transcript has too much silence/noise | Tune `VAD_*` and `NOISE_*` values in `.env.local`, then rerun transcription with `force: true` |
 | Can't join room | Verify `LIVEKIT_API_KEY` / `LIVEKIT_API_SECRET` match across `livekit.yaml`, `egress.yaml`, and `.env.local` |
 | ngrok URL changed | Update `NEXT_PUBLIC_LIVEKIT_URL` in `.env.local` and restart `npm run dev` |
 | GitHub push blocked — secret detected | Secrets in old commits need a history rewrite, not just `.gitignore` |
