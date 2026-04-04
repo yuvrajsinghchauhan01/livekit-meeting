@@ -7,11 +7,18 @@ import { Track, TrackPublication } from "livekit-client";
 interface Props {
   roomName:            string;
   participantIdentity: string;
+  displayName:         string;
   appToken:            string;
   onStopRef:           React.MutableRefObject<() => void>;
 }
 
-export default function RecordingControls({ roomName, participantIdentity, appToken, onStopRef }: Props) {
+export default function RecordingControls({
+  roomName,
+  participantIdentity,
+  displayName,
+  appToken,
+  onStopRef,
+}: Props) {
   const { localParticipant } = useLocalParticipant();
   const [recording, setRecording] = useState(false);
   const [error, setError]         = useState<string | null>(null);
@@ -51,6 +58,7 @@ export default function RecordingControls({ roomName, participantIdentity, appTo
       egressId:            egressId.current,
       roomName,
       participantIdentity,
+      displayName,
       trackSid:            trackSid.current,
       startedAt:           startedAt.current,
       appToken,

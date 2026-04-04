@@ -25,7 +25,15 @@ export async function verifyAppToken(
 ): Promise<AppTokenPayload | null> {
   try {
     const { payload } = await jwtVerify(token, secret);
-    return payload as AppTokenPayload;
+    if (typeof payload.username !== "string") {
+      return null;
+    }
+
+    return {
+      username: payload.username,
+      iat: payload.iat,
+      exp: payload.exp,
+    };
   } catch {
     return null;
   }

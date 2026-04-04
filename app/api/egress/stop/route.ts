@@ -1,10 +1,10 @@
 import { NextRequest, NextResponse } from "next/server";
 import { verifyAppToken } from "@/lib/auth";
 import { EgressClient } from "livekit-server-sdk";
-import { S3Client, PutObjectCommand } from "@aws-sdk/client-s3";
+import { S3Client, PutObjectCommand, HeadObjectCommand } from "@aws-sdk/client-s3";
+import { getAppMetadataKey, queueRoomTranscription } from "@/lib/transcription";
 
 export async function POST(req: NextRequest) {
-  // Auth — sendBeacon can't set headers, so accept token from body too
   let body: Record<string, unknown>;
   try {
     body = await req.json();
@@ -20,7 +20,13 @@ export async function POST(req: NextRequest) {
     return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
   }
 
-  const { egressId, roomName, participantIdentity, trackSid, startedAt } = body as Record<string, string | number>;
+  const egressId            = typeof body.egressId === "string" ? body.egressId : "";
+  const roomName            = typeof body.roomName === "string" ? body.roomName : "";
+  const participantIdentity = typeof body.participantIdentity === "string" ? body.participantIdentity : "";
+  const displayName         = typeof body.displayName === "string" ? body.displayName : "";
+  const trackSid            = typeof body.trackSid === "string" ? body.trackSid : "";
+  const startedAt           = typeof body.startedAt === "number" ? body.startedAt : null;
+
   if (!egressId) {
     return NextResponse.json({ error: "egressId required" }, { status: 400 });
   }
@@ -35,21 +41,7 @@ export async function POST(req: NextRequest) {
     const egressInfo = await egressClient.stopEgress(egressId);
     const stoppedAt = Date.now();
 
-    // Write metadata JSON alongside the OGG file if we have full context
     if (roomName && participantIdentity && trackSid) {
-      const metadata = {
-        roomName,
-        participantIdentity,
-        trackSid,
-        audioFile: `TR_${trackSid}.ogg`,
-        startedAt:   startedAt ?? null,
-        stoppedAt,
-        durationMs:  startedAt ? stoppedAt - startedAt : null,
-        // ISO strings for human readability
-        startedAtISO:  startedAt ? new Date(startedAt).toISOString() : null,
-        stoppedAtISO:  new Date(stoppedAt).toISOString(),
-      };
-
       const s3 = new S3Client({
         region: process.env.AWS_REGION!,
         credentials: {
@@ -58,13 +50,63 @@ export async function POST(req: NextRequest) {
         },
       });
 
-      const metaKey = `recordings/${roomName}/${participantIdentity}/EG_${trackSid}.json`;
-      await s3.send(new PutObjectCommand({
-        Bucket:      process.env.S3_BUCKET!,
-        Key:         metaKey,
-        Body:        JSON.stringify(metadata, null, 2),
-        ContentType: "application/json",
-      }));
+      const metaKey    = `recordings/${roomName}/${participantIdentity}/EG_${trackSid}.json`;
+      const appMetaKey = getAppMetadataKey(roomName, participantIdentity, trackSid);
+
+      // Idempotency — skip writes if already written (double-stop from sendBeacon + leave)
+      const alreadyWritten = await s3.send(new HeadObjectCommand({
+        Bucket: process.env.S3_BUCKET!,
+        Key: metaKey,
+      })).then(() => true).catch(() => false);
+
+      if (!alreadyWritten) {
+        await s3.send(new PutObjectCommand({
+          Bucket:      process.env.S3_BUCKET!,
+          Key:         metaKey,
+          Body:        JSON.stringify({
+            roomName,
+            participantIdentity,
+            trackSid,
+            audioFile:    `TR_${trackSid}.ogg`,
+            startedAt,
+            stoppedAt,
+            durationMs:   startedAt ? stoppedAt - startedAt : null,
+            startedAtISO: startedAt ? new Date(startedAt).toISOString() : null,
+            stoppedAtISO: new Date(stoppedAt).toISOString(),
+          }, null, 2),
+          ContentType: "application/json",
+        }));
+
+        // APP_*.json — includes displayName for transcription speaker mapping
+        await s3.send(new PutObjectCommand({
+          Bucket:      process.env.S3_BUCKET!,
+          Key:         appMetaKey,
+          Body:        JSON.stringify({
+            roomName,
+            participantIdentity,
+            displayName: displayName.trim() || participantIdentity,
+            trackSid,
+            audioFileKey:      `recordings/${roomName}/${participantIdentity}/TR_${trackSid}.ogg`,
+            egressMetadataKey: metaKey,
+            startedAt,
+            stoppedAt,
+            recordedAt: new Date(stoppedAt).toISOString(),
+          }, null, 2),
+          ContentType: "application/json",
+        }));
+      }
+
+      // Auto-trigger transcription when last participant stops recording
+      try {
+        const activeEgress = await egressClient.listEgress({ roomName, active: true });
+        if (activeEgress.length === 0) {
+          void queueRoomTranscription({ roomName, trigger: "automatic" }).catch((err) => {
+            console.error(`Auto transcription queue failed for ${roomName}:`, err);
+          });
+        }
+      } catch (err) {
+        console.error(`Failed to check active egress for ${roomName}:`, err);
+      }
     }
 
     return NextResponse.json({ status: egressInfo.status, egressId, stoppedAt });

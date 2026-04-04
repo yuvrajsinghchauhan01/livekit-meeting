@@ -31,7 +31,7 @@ export async function POST(req: NextRequest) {
     const existing = await egressClient.listEgress({ roomName, active: true });
     const match = existing.find(
       (e) =>
-        e.trackEgress &&
+        Boolean((e as { trackEgress?: unknown }).trackEgress) &&
         "participantIdentity" in e &&
         (e as { participantIdentity?: string }).participantIdentity === participantIdentity
     );

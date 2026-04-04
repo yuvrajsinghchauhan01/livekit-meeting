@@ -18,8 +18,8 @@ interface Props {
   onLeave:     () => void;
 }
 
-function RoomInner({ roomName, identity, appToken, onLeave }: {
-  roomName: string; identity: string; appToken: string; onLeave: () => void;
+function RoomInner({ roomName, identity, displayName, appToken, onLeave }: {
+  roomName: string; identity: string; displayName: string; appToken: string; onLeave: () => void;
 }) {
   const participants = useParticipants();
   const stopRecordingRef = useRef<() => void>(() => {});
@@ -44,7 +44,7 @@ function RoomInner({ roomName, identity, appToken, onLeave }: {
           <div>
             <h1 className="font-semibold text-white text-sm">{roomName}</h1>
             <p className="text-slate-400 text-xs">
-              {participants.length} participant{participants.length !== 1 ? "s" : ""}
+              {participants.length} participant{participants.length !== 1 ? "s" : ""} · You: {displayName}
             </p>
           </div>
         </div>
@@ -53,6 +53,7 @@ function RoomInner({ roomName, identity, appToken, onLeave }: {
           <RecordingControls
             roomName={roomName}
             participantIdentity={identity}
+            displayName={displayName}
             appToken={appToken}
             onStopRef={stopRecordingRef}
           />
@@ -93,6 +94,7 @@ export default function MeetingRoom({ roomName, token, appToken, displayName, id
       <RoomInner
         roomName={roomName}
         identity={identity}
+        displayName={displayName}
         appToken={appToken}
         onLeave={onLeave}
       />
