@@ -25,6 +25,13 @@ const CANONICAL_METADATA_NAME = "metadata.json";
 const WHISPER_CHUNK_SECONDS = Number(
   process.env.WHISPER_CHUNK_SECONDS || "45"
 );
+const VAD_SILENCE_NOISE = process.env.VAD_SILENCE_NOISE || "-35dB";
+const VAD_MIN_SILENCE_SECONDS = Number(
+  process.env.VAD_MIN_SILENCE_SECONDS || "0.6"
+);
+const VAD_MIN_SPEECH_MS = Number(process.env.VAD_MIN_SPEECH_MS || "400");
+const VAD_PADDING_MS = Number(process.env.VAD_PADDING_MS || "200");
+const VAD_MERGE_GAP_MS = Number(process.env.VAD_MERGE_GAP_MS || "700");
 const TRANSCRIPTION_HINTS = process.env.OPENAI_TRANSCRIPTION_HINTS || "";
 
 const roomJobs = new Map<string, Promise<TranscriptionRunResult>>();
@@ -122,6 +129,11 @@ interface PreparedAudioChunk {
   filename: string;
   buffer: Buffer;
   startMs: number;
+}
+
+interface SpeechWindow {
+  startMs: number;
+  endMs: number;
 }
 
 interface RawTrackDescriptor {
@@ -750,18 +762,93 @@ function mapCanonicalMsToAbsolute(
   return segment.started_at + Math.min(offsetMs, segment.duration_ms);
 }
 
-async function prepareAudioChunks(
-  audioBuffer: Buffer,
-  baseName: string
-): Promise<PreparedAudioChunk[]> {
-  const tempDir = await mkdtemp(join(tmpdir(), "livekit-whisper-"));
-  try {
-    const inputPath = join(tempDir, "input.ogg");
-    const normalizedPath = join(tempDir, "normalized.wav");
-    const chunkPattern = join(tempDir, "chunk-%03d.wav");
-    await writeFile(inputPath, audioBuffer);
+function parseTimestampToMs(value: string) {
+  const match = value.match(/(\d+):(\d+):([\d.]+)/);
+  if (!match) return null;
 
-    await execFileAsync("/opt/homebrew/bin/ffmpeg", [
+  const hours = Number(match[1]);
+  const minutes = Number(match[2]);
+  const seconds = Number(match[3]);
+  if (![hours, minutes, seconds].every(Number.isFinite)) return null;
+
+  return Math.round(((hours * 60 + minutes) * 60 + seconds) * 1000);
+}
+
+function normalizeSpeechWindows(
+  windows: SpeechWindow[],
+  totalDurationMs: number
+): SpeechWindow[] {
+  if (windows.length === 0) return [];
+
+  const padded = windows
+    .map((window) => ({
+      startMs: Math.max(0, window.startMs - VAD_PADDING_MS),
+      endMs: Math.min(totalDurationMs, window.endMs + VAD_PADDING_MS),
+    }))
+    .filter((window) => window.endMs - window.startMs >= VAD_MIN_SPEECH_MS)
+    .sort((a, b) => a.startMs - b.startMs);
+
+  if (padded.length === 0) return [];
+
+  const merged: SpeechWindow[] = [padded[0]];
+  for (const window of padded.slice(1)) {
+    const previous = merged[merged.length - 1];
+    if (window.startMs - previous.endMs <= VAD_MERGE_GAP_MS) {
+      previous.endMs = Math.max(previous.endMs, window.endMs);
+      continue;
+    }
+
+    merged.push({ ...window });
+  }
+
+  return merged;
+}
+
+function extractSpeechWindowsFromSilenceLog(output: string): SpeechWindow[] {
+  const durationMatch = output.match(/Duration:\s*(\d+:\d+:\d+(?:\.\d+)?)/);
+  const totalDurationMs = durationMatch
+    ? parseTimestampToMs(durationMatch[1]) || 0
+    : 0;
+
+  const silenceStarts = Array.from(
+    output.matchAll(/silence_start:\s*([\d.]+)/g),
+    (match) => Math.round(Number(match[1]) * 1000)
+  ).filter(Number.isFinite);
+  const silenceEnds = Array.from(
+    output.matchAll(/silence_end:\s*([\d.]+)/g),
+    (match) => Math.round(Number(match[1]) * 1000)
+  ).filter(Number.isFinite);
+
+  if (totalDurationMs <= 0) return [];
+  if (silenceStarts.length === 0 && silenceEnds.length === 0) {
+    return [{ startMs: 0, endMs: totalDurationMs }];
+  }
+
+  const windows: SpeechWindow[] = [];
+  let cursorMs = 0;
+
+  for (let index = 0; index < silenceStarts.length; index += 1) {
+    const silenceStartMs = Math.max(cursorMs, silenceStarts[index]);
+    const silenceEndMs = Math.max(silenceStartMs, silenceEnds[index] ?? silenceStartMs);
+
+    if (silenceStartMs - cursorMs >= VAD_MIN_SPEECH_MS) {
+      windows.push({ startMs: cursorMs, endMs: silenceStartMs });
+    }
+
+    cursorMs = silenceEndMs;
+  }
+
+  if (totalDurationMs - cursorMs >= VAD_MIN_SPEECH_MS) {
+    windows.push({ startMs: cursorMs, endMs: totalDurationMs });
+  }
+
+  return normalizeSpeechWindows(windows, totalDurationMs);
+}
+
+async function normalizeAudioFile(inputPath: string, normalizedPath: string) {
+  await execFileAsync(
+    "/opt/homebrew/bin/ffmpeg",
+    [
       "-y",
       "-i",
       inputPath,
@@ -773,43 +860,99 @@ async function prepareAudioChunks(
       "-af",
       "highpass=f=120,lowpass=f=7600,dynaudnorm",
       normalizedPath,
-    ]);
+    ],
+    { maxBuffer: 10 * 1024 * 1024 }
+  );
+}
 
-    await execFileAsync("/opt/homebrew/bin/ffmpeg", [
-      "-y",
+async function detectSpeechWindows(normalizedPath: string) {
+  const { stderr } = await execFileAsync(
+    "/opt/homebrew/bin/ffmpeg",
+    [
       "-i",
       normalizedPath,
+      "-af",
+      `silencedetect=noise=${VAD_SILENCE_NOISE}:d=${VAD_MIN_SILENCE_SECONDS}`,
       "-f",
-      "segment",
-      "-segment_time",
-      String(WHISPER_CHUNK_SECONDS),
-      "-c",
-      "copy",
-      chunkPattern,
-    ]);
+      "null",
+      "-",
+    ],
+    { maxBuffer: 10 * 1024 * 1024 }
+  );
 
-    const files = (await execFileAsync("/bin/ls", [tempDir])).stdout
-      .split("\n")
-      .map((item) => item.trim())
-      .filter((item) => /^chunk-\d+\.wav$/.test(item))
-      .sort();
+  const durationMatch = stderr.match(/Duration:\s*(\d+:\d+:\d+(?:\.\d+)?)/);
+  return {
+    totalDurationMs: durationMatch ? parseTimestampToMs(durationMatch[1]) || 0 : 0,
+    speechWindows: extractSpeechWindowsFromSilenceLog(stderr),
+  };
+}
 
-    if (files.length === 0) {
-      return [
-        {
-          filename: `${baseName}-normalized.wav`,
-          buffer: await readFile(normalizedPath),
-          startMs: 0,
-        },
-      ];
-    }
+async function prepareAudioChunks(
+  audioBuffer: Buffer,
+  baseName: string
+): Promise<PreparedAudioChunk[]> {
+  const tempDir = await mkdtemp(join(tmpdir(), "livekit-whisper-"));
+  try {
+    const inputPath = join(tempDir, "input.ogg");
+    const normalizedPath = join(tempDir, "normalized.wav");
+    await writeFile(inputPath, audioBuffer);
+    await normalizeAudioFile(inputPath, normalizedPath);
+
+    const { speechWindows, totalDurationMs } = await detectSpeechWindows(normalizedPath);
+    const windows =
+      speechWindows.length > 0
+        ? speechWindows
+        : [{ startMs: 0, endMs: Math.max(totalDurationMs, 1000) }];
 
     const chunks: PreparedAudioChunk[] = [];
-    for (let index = 0; index < files.length; index += 1) {
+    let chunkIndex = 0;
+
+    for (const window of windows) {
+      for (
+        let chunkStartMs = window.startMs;
+        chunkStartMs < window.endMs;
+        chunkStartMs += WHISPER_CHUNK_SECONDS * 1000
+      ) {
+        const chunkEndMs = Math.min(
+          window.endMs,
+          chunkStartMs + WHISPER_CHUNK_SECONDS * 1000
+        );
+        const durationMs = chunkEndMs - chunkStartMs;
+        if (durationMs < VAD_MIN_SPEECH_MS) continue;
+
+        const chunkPath = join(tempDir, `chunk-${String(chunkIndex).padStart(3, "0")}.wav`);
+        await execFileAsync(
+          "/opt/homebrew/bin/ffmpeg",
+          [
+            "-y",
+            "-ss",
+            (chunkStartMs / 1000).toFixed(3),
+            "-t",
+            (durationMs / 1000).toFixed(3),
+            "-i",
+            normalizedPath,
+            "-acodec",
+            "pcm_s16le",
+            chunkPath,
+          ],
+          { maxBuffer: 10 * 1024 * 1024 }
+        );
+
+        chunks.push({
+          filename: `${baseName}-chunk-${String(chunkIndex).padStart(3, "0")}.wav`,
+          buffer: await readFile(chunkPath),
+          startMs: chunkStartMs,
+        });
+
+        chunkIndex += 1;
+      }
+    }
+
+    if (chunks.length === 0) {
       chunks.push({
-        filename: `${baseName}-${files[index]}`,
-        buffer: await readFile(join(tempDir, files[index])),
-        startMs: index * WHISPER_CHUNK_SECONDS * 1000,
+        filename: `${baseName}-normalized.wav`,
+        buffer: await readFile(normalizedPath),
+        startMs: 0,
       });
     }
 
