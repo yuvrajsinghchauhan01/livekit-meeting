@@ -21,15 +21,34 @@ export async function POST(req: NextRequest) {
   const roomName = typeof body.roomName === "string" ? body.roomName.trim() : "";
   const prefix = typeof body.prefix === "string" && body.prefix.trim() ? body.prefix.trim() : undefined;
   const force = body.force === true;
+  const provider =
+    typeof body.provider === "string" && body.provider.trim()
+      ? body.provider.trim().toLowerCase()
+      : undefined;
 
   if (!roomName) {
     return NextResponse.json({ error: "roomName required" }, { status: 400 });
   }
 
   try {
-    const queued = await queueRoomTranscription({ roomName, prefix, force, trigger: "manual" });
+    const queued = await queueRoomTranscription({
+      roomName,
+      prefix,
+      force,
+      trigger: "manual",
+      provider: provider as "openai" | "voxtral" | undefined,
+    });
     return NextResponse.json(
-      { roomName, force, trigger: "manual", status: queued.status, outputKeys: queued.outputKeys, reason: queued.reason ?? null },
+      {
+        roomName,
+        force,
+        trigger: "manual",
+        provider: queued.provider,
+        status: queued.status,
+        outputKeys: queued.outputKeys,
+        providerOutputKeys: queued.providerOutputKeys,
+        reason: queued.reason ?? null,
+      },
       { status: 202 }
     );
   } catch (error) {

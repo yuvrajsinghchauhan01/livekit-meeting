@@ -40,6 +40,9 @@ export async function POST(req: NextRequest) {
   try {
     const egressInfo = await egressClient.stopEgress(egressId);
     const stoppedAt = Date.now();
+    console.log(
+      `[egress:stop] stopped egress=${egressId} room=${roomName || "unknown"} participant=${participantIdentity || "unknown"} track=${trackSid || "unknown"} status=${egressInfo.status}`
+    );
 
     if (roomName && participantIdentity && trackSid) {
       const s3 = new S3Client({
@@ -60,6 +63,9 @@ export async function POST(req: NextRequest) {
       })).then(() => true).catch(() => false);
 
       if (!alreadyWritten) {
+        console.log(
+          `[egress:stop] writing metadata room=${roomName} participant=${participantIdentity} track=${trackSid}`
+        );
         await s3.send(new PutObjectCommand({
           Bucket:      process.env.S3_BUCKET!,
           Key:         metaKey,
@@ -94,15 +100,29 @@ export async function POST(req: NextRequest) {
           }, null, 2),
           ContentType: "application/json",
         }));
+      } else {
+        console.log(
+          `[egress:stop] metadata already exists room=${roomName} participant=${participantIdentity} track=${trackSid}, skipping write`
+        );
       }
 
       // Auto-trigger transcription when last participant stops recording
       try {
         const activeEgress = await egressClient.listEgress({ roomName, active: true });
+        console.log(
+          `[egress:stop] active egress check room=${roomName} active=${activeEgress.length}`
+        );
         if (activeEgress.length === 0) {
+          console.log(
+            `[egress:stop] queueing automatic transcription room=${roomName}`
+          );
           void queueRoomTranscription({ roomName, trigger: "automatic" }).catch((err) => {
             console.error(`Auto transcription queue failed for ${roomName}:`, err);
           });
+        } else {
+          console.log(
+            `[egress:stop] not queueing transcription yet room=${roomName} active_egress_remaining=${activeEgress.length}`
+          );
         }
       } catch (err) {
         console.error(`Failed to check active egress for ${roomName}:`, err);

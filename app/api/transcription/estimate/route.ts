@@ -20,13 +20,17 @@ export async function POST(req: NextRequest) {
 
   const roomName = typeof body.roomName === "string" ? body.roomName.trim() : "";
   const prefix = typeof body.prefix === "string" && body.prefix.trim() ? body.prefix.trim() : undefined;
+  const provider =
+    typeof body.provider === "string" && body.provider.trim()
+      ? body.provider.trim().toLowerCase()
+      : undefined;
 
   if (!roomName) {
     return NextResponse.json({ error: "roomName required" }, { status: 400 });
   }
 
   try {
-    const estimate = await estimateRoomTranscriptionCost(roomName, prefix);
+    const estimate = await estimateRoomTranscriptionCost(roomName, prefix, provider);
     return NextResponse.json(estimate);
   } catch (error) {
     const message = error instanceof Error ? error.message : "Unknown error";

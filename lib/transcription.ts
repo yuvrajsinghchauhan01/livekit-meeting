@@ -10,12 +10,19 @@ import {
   PutObjectCommand,
   S3Client,
 } from "@aws-sdk/client-s3";
+import {
+  NormalizedTranscriptionResponse,
+  NormalizedTranscriptionSegment,
+  TranscriptionProviderName,
+} from "@/lib/transcription/provider-types";
+import {
+  getTranscriptionProvider,
+  resolveTranscriptionProviderName,
+} from "@/lib/transcription/providers";
 
 const execFileAsync = promisify(execFile);
 
 const OPENAI_BASE_URL = process.env.OPENAI_BASE_URL || "https://api.openai.com/v1";
-const DEFAULT_TRANSCRIPTION_MODEL =
-  process.env.OPENAI_TRANSCRIPTION_MODEL || "whisper-1";
 const DEFAULT_TRANSLATION_MODEL =
   process.env.OPENAI_TRANSLATION_MODEL || "gpt-4o-mini";
 const TRANSCRIPT_DIR = "_transcripts";
@@ -52,13 +59,16 @@ interface QueueRoomTranscriptionOptions {
   prefix?: string;
   force?: boolean;
   trigger: "manual" | "automatic";
+  provider?: TranscriptionProviderName;
 }
 
 export interface QueueRoomTranscriptionResult {
   status: "accepted" | "already_running" | "skipped";
   roomName: string;
   trigger: "manual" | "automatic";
+  provider: TranscriptionProviderName;
   outputKeys: TranscriptOutputKeys;
+  providerOutputKeys: TranscriptOutputKeys;
   canonicalOutputKeys: string[];
   force: boolean;
   reason?: string;
@@ -115,21 +125,6 @@ interface CanonicalParticipantMetadata {
   duration_ms: number;
   updated_at: string;
   segments: CanonicalSegmentMetadata[];
-}
-
-interface OpenAITranscriptionSegment {
-  start?: number;
-  end?: number;
-  text?: string;
-  avg_logprob?: number;
-  confidence?: number;
-}
-
-interface OpenAITranscriptionResponse {
-  text?: string;
-  language?: string;
-  duration?: number;
-  segments?: OpenAITranscriptionSegment[];
 }
 
 interface PreparedAudioChunk {
@@ -202,6 +197,7 @@ interface TrackTranscriptArtifact {
   stopped_at: number | null;
   audio_file: string;
   metadata_file: string;
+  transcription_provider: TranscriptionProviderName;
   transcription_model: string;
   translation_model: string;
   language: string;
@@ -232,6 +228,8 @@ interface MeetingTranscriptArtifact {
 interface TranscriptionManifest {
   room_name: string;
   trigger: "manual" | "automatic";
+  provider: TranscriptionProviderName;
+  provider_model: string;
   status: "completed" | "completed_with_errors" | "failed";
   generated_at: string;
   output_keys: TranscriptOutputKeys;
@@ -245,7 +243,10 @@ interface TranscriptionManifest {
 interface TranscriptionRunResult {
   roomName: string;
   trigger: "manual" | "automatic";
+  provider: TranscriptionProviderName;
+  providerModel: string;
   outputKeys: TranscriptOutputKeys;
+  providerOutputKeys: TranscriptOutputKeys;
   canonicalOutputKeys: string[];
   status: "completed" | "completed_with_errors" | "failed";
   processedTracks: number;
@@ -262,6 +263,7 @@ interface TranslationItem {
 export interface RoomTranscriptionCostEstimate {
   room_name: string;
   prefix: string;
+  provider: TranscriptionProviderName;
   models: { transcription: string; translation: string };
   pricing: {
     transcription_usd_per_minute: number;
@@ -283,6 +285,7 @@ export interface RoomTranscriptionCostEstimate {
     estimated_transcription_cost_usd: number | null;
   }>;
   warnings: string[];
+  pricing_unavailable?: boolean;
 }
 
 function sleep(ms: number) {
@@ -312,6 +315,20 @@ function getRoomPrefix(roomName: string, prefix?: string) {
 function getOutputKeys(roomName: string, prefix?: string): TranscriptOutputKeys {
   const roomPrefix = getRoomPrefix(roomName, prefix).replace(/\/?$/, "/");
   const transcriptPrefix = `${roomPrefix}${TRANSCRIPT_DIR}/`;
+  return {
+    trackPrefix: transcriptPrefix,
+    finalTranscript: `${transcriptPrefix}meeting_transcript.en.json`,
+    manifest: `${transcriptPrefix}manifest.json`,
+  };
+}
+
+function getProviderOutputKeys(
+  roomName: string,
+  provider: TranscriptionProviderName,
+  prefix?: string
+): TranscriptOutputKeys {
+  const roomPrefix = getRoomPrefix(roomName, prefix).replace(/\/?$/, "/");
+  const transcriptPrefix = `${roomPrefix}${TRANSCRIPT_DIR}/providers/${provider}/`;
   return {
     trackPrefix: transcriptPrefix,
     finalTranscript: `${transcriptPrefix}meeting_transcript.en.json`,
@@ -427,7 +444,7 @@ function resolveRawAudioKey(
   return null;
 }
 
-function toConfidence(segment: OpenAITranscriptionSegment) {
+function toConfidence(segment: NormalizedTranscriptionSegment) {
   if (typeof segment.confidence === "number") return segment.confidence;
   if (typeof segment.avg_logprob === "number") {
     return Number(Math.exp(segment.avg_logprob).toFixed(4));
@@ -637,6 +654,9 @@ async function canonicalizeRoomParticipants(
 ) {
   const rawTracks = await discoverRawTracks(roomName, prefix);
   const canonicalOutputKeys: string[] = [];
+  console.log(
+    `[transcription:canonicalize] room=${roomName} raw_tracks=${rawTracks.length} force=${force}`
+  );
 
   if (rawTracks.length === 0) {
     return { participants: [] as CanonicalParticipantDescriptor[], canonicalOutputKeys };
@@ -674,9 +694,16 @@ async function canonicalizeRoomParticipants(
     }
 
     if (shouldRebuild) {
+      console.log(
+        `[transcription:canonicalize] rebuilding participant=${participantIdentity} room=${roomName} segments=${sortedTracks.length}`
+      );
       const mergedAudio = await mergeParticipantAudio(sortedTracks);
       await writeBinaryToS3(audioKey, Buffer.from(mergedAudio), "audio/ogg");
       await writeJsonToS3(metadataKey, metadata);
+    } else {
+      console.log(
+        `[transcription:canonicalize] reusing participant=${participantIdentity} room=${roomName} segments=${sortedTracks.length}`
+      );
     }
 
     canonicalOutputKeys.push(audioKey, metadataKey);
@@ -910,6 +937,9 @@ async function prepareAudioChunks(
       speechWindows.length > 0
         ? speechWindows
         : [{ startMs: 0, endMs: Math.max(totalDurationMs, 1000) }];
+    console.log(
+      `[transcription:vad] track=${baseName} speech_windows=${speechWindows.length} selected_windows=${windows.length} duration_ms=${totalDurationMs}`
+    );
 
     const chunks: PreparedAudioChunk[] = [];
     let chunkIndex = 0;
@@ -962,6 +992,10 @@ async function prepareAudioChunks(
         startMs: 0,
       });
     }
+
+    console.log(
+      `[transcription:chunks] track=${baseName} chunks=${chunks.length}`
+    );
 
     return chunks;
   } finally {
@@ -1034,29 +1068,20 @@ function inferMeetingLanguageLabel(originalText: string, englishText?: string) {
   return "unknown";
 }
 
-async function transcribeAudio(buffer: Buffer, filename: string, prompt: string) {
-  const form = new FormData();
-  const blob = new Blob([new Uint8Array(buffer)], { type: "audio/ogg" });
-  form.append("file", blob, filename);
-  form.append("model", DEFAULT_TRANSCRIPTION_MODEL);
-  form.append("response_format", "verbose_json");
-  form.append("timestamp_granularities[]", "segment");
-  if (prompt.trim()) {
-    form.append("prompt", prompt);
-  }
-
-  const response = await fetch(`${OPENAI_BASE_URL}/audio/transcriptions`, {
-    method: "POST",
-    headers: getOpenAIHeaders(),
-    body: form,
+async function transcribeAudio(
+  provider: TranscriptionProviderName,
+  buffer: Buffer,
+  filename: string,
+  prompt: string
+) {
+  return getTranscriptionProvider(provider).transcribe({
+    buffer,
+    filename,
+    mimeType: "audio/wav",
+    prompt,
+    timestampGranularities: ["segment"],
+    diarize: false,
   });
-
-  if (!response.ok) {
-    const text = await response.text();
-    throw new Error(`OpenAI transcription failed: ${response.status} ${text}`);
-  }
-
-  return (await response.json()) as OpenAITranscriptionResponse;
 }
 
 async function translateBatch(items: Array<{ index: number; text: string; language: string }>) {
@@ -1138,7 +1163,10 @@ function splitFallbackUtterances(text: string) {
     .filter(Boolean);
 }
 
-function buildTrackUtterances(track: TrackDescriptor, transcription: OpenAITranscriptionResponse) {
+function buildTrackUtterances(
+  track: TrackDescriptor,
+  transcription: NormalizedTranscriptionResponse
+) {
   const language = transcription.language || "unknown";
   const segments =
     transcription.segments?.filter(
@@ -1279,16 +1307,31 @@ function filterNoiseUtterances(utterances: TrackUtterance[]) {
   return utterances.filter((utterance) => !isLikelyNoiseUtterance(utterance));
 }
 
-async function createTrackTranscript(track: TrackDescriptor): Promise<TrackTranscriptArtifact> {
+async function createTrackTranscript(
+  track: TrackDescriptor,
+  provider: TranscriptionProviderName
+): Promise<TrackTranscriptArtifact> {
   const s3 = getS3Client();
   const audioBuffer = await readBinaryObject(s3, track.audioFileKey);
   const preparedChunks = await prepareAudioChunks(audioBuffer, track.trackId);
   const prompt = buildTranscriptionPrompt(track);
   const chunkUtterances: TrackUtterance[] = [];
   let dominantLanguage = "unknown";
+  const adapter = getTranscriptionProvider(provider);
+  console.log(
+    `[transcription:track:start] room=${track.roomName} provider=${provider} participant=${track.participantIdentity} display_name=${track.displayName} chunks=${preparedChunks.length}`
+  );
 
   for (const chunk of preparedChunks) {
-    const transcription = await transcribeAudio(chunk.buffer, chunk.filename, prompt);
+    const transcription = await transcribeAudio(
+      provider,
+      chunk.buffer,
+      chunk.filename,
+      prompt
+    );
+    console.log(
+      `[transcription:track:chunk] room=${track.roomName} provider=${provider} participant=${track.participantIdentity} chunk=${chunk.filename} segments=${transcription.segments?.length || 0} language=${transcription.language || "unknown"}`
+    );
     if (dominantLanguage === "unknown" && transcription.language) {
       dominantLanguage = transcription.language;
     }
@@ -1340,6 +1383,9 @@ async function createTrackTranscript(track: TrackDescriptor): Promise<TrackTrans
       };
     })
   );
+  console.log(
+    `[transcription:track:done] room=${track.roomName} provider=${provider} participant=${track.participantIdentity} utterances=${hydratedUtterances.length} dominant_language=${dominantLanguage}`
+  );
 
   return {
     room_name: track.roomName,
@@ -1350,7 +1396,8 @@ async function createTrackTranscript(track: TrackDescriptor): Promise<TrackTrans
     stopped_at: track.stoppedAt,
     audio_file: track.audioFileKey,
     metadata_file: track.metadataKey,
-    transcription_model: DEFAULT_TRANSCRIPTION_MODEL,
+    transcription_provider: provider,
+    transcription_model: adapter.getModel(),
     translation_model: DEFAULT_TRANSLATION_MODEL,
     language: dominantLanguage,
     utterances: hydratedUtterances,
@@ -1360,7 +1407,8 @@ async function createTrackTranscript(track: TrackDescriptor): Promise<TrackTrans
 function buildMeetingTranscript(
   roomName: string,
   trackArtifacts: TrackTranscriptArtifact[],
-  sourceFiles: string[]
+  sourceFiles: string[],
+  providerModel: string
 ): MeetingTranscriptArtifact {
   const roomStartCandidates = trackArtifacts
     .map((artifact) => artifact.started_at)
@@ -1400,7 +1448,7 @@ function buildMeetingTranscript(
     room_name: roomName,
     generated_at: new Date().toISOString(),
     models: {
-      transcription: DEFAULT_TRANSCRIPTION_MODEL,
+      transcription: providerModel,
       translation: DEFAULT_TRANSLATION_MODEL,
     },
     source_files: sourceFiles,
@@ -1421,8 +1469,16 @@ async function runRoomTranscriptionJob(
   options: QueueRoomTranscriptionOptions
 ): Promise<TranscriptionRunResult> {
   const { roomName, prefix, trigger, force = false } = options;
+  const provider = resolveTranscriptionProviderName(options.provider);
+  const providerAdapter = getTranscriptionProvider(provider);
+  const providerModel = providerAdapter.getModel();
+  const defaultProvider = resolveTranscriptionProviderName();
   const outputKeys = getOutputKeys(roomName, prefix);
+  const providerOutputKeys = getProviderOutputKeys(roomName, provider, prefix);
   const s3 = getS3Client();
+  console.log(
+    `[transcription:job:start] room=${roomName} trigger=${trigger} provider=${provider} model=${providerModel} force=${force}`
+  );
 
   if (trigger === "automatic") await sleep(3000);
 
@@ -1432,11 +1488,17 @@ async function runRoomTranscriptionJob(
       ? canonicalized.participants
       : await discoverCanonicalParticipants(roomName, prefix);
 
-  if (!force && (await objectExists(s3, outputKeys.finalTranscript))) {
+  if (!force && (await objectExists(s3, providerOutputKeys.finalTranscript))) {
+    console.log(
+      `[transcription:job:skip] room=${roomName} provider=${provider} reason=existing_output`
+    );
     return {
       roomName,
       trigger,
+      provider,
+      providerModel,
       outputKeys,
+      providerOutputKeys,
       canonicalOutputKeys: canonicalized.canonicalOutputKeys,
       status: "completed",
       processedTracks: 0,
@@ -1448,23 +1510,38 @@ async function runRoomTranscriptionJob(
 
   if (canonicalParticipants.length === 0) {
     const error = `No canonical participant files found under ${getRoomPrefix(roomName, prefix)}`;
-    await writeJsonToS3(outputKeys.manifest, {
+    console.error(
+      `[transcription:job:failed] room=${roomName} provider=${provider} reason=no_canonical_participants`
+    );
+    const providerFailureManifest: TranscriptionManifest = {
       room_name: roomName,
       trigger,
+      provider,
+      provider_model: providerModel,
       status: "failed",
       generated_at: new Date().toISOString(),
-      output_keys: outputKeys,
+      output_keys: providerOutputKeys,
       canonical_output_keys: canonicalized.canonicalOutputKeys,
       source_files: [],
       processed_tracks: 0,
       failed_tracks: 0,
       errors: [error],
-    } as TranscriptionManifest);
+    };
+    await writeJsonToS3(providerOutputKeys.manifest, providerFailureManifest);
+    if (provider === defaultProvider) {
+      await writeJsonToS3(outputKeys.manifest, {
+        ...providerFailureManifest,
+        output_keys: outputKeys,
+      } satisfies TranscriptionManifest);
+    }
 
     return {
       roomName,
       trigger,
+      provider,
+      providerModel,
       outputKeys,
+      providerOutputKeys,
       canonicalOutputKeys: canonicalized.canonicalOutputKeys,
       status: "failed",
       processedTracks: 0,
@@ -1475,17 +1552,26 @@ async function runRoomTranscriptionJob(
   }
 
   const tracks = toTrackDescriptors(canonicalParticipants);
+  console.log(
+    `[transcription:job:tracks] room=${roomName} provider=${provider} tracks=${tracks.length}`
+  );
   const trackArtifacts: TrackTranscriptArtifact[] = [];
   const errors: string[] = [];
   const sourceFiles = canonicalParticipants.map((participant) => participant.audioFileKey);
 
   for (const track of tracks) {
     try {
-      const artifact = await createTrackTranscript(track);
+      const artifact = await createTrackTranscript(track, provider);
       trackArtifacts.push(artifact);
-      await writeJsonToS3(`${outputKeys.trackPrefix}track_${track.trackId}.json`, artifact);
+      await writeJsonToS3(
+        `${providerOutputKeys.trackPrefix}track_${track.trackId}.json`,
+        artifact
+      );
     } catch (error) {
       const message = error instanceof Error ? error.message : "Unknown error";
+      console.error(
+        `[transcription:track:error] room=${roomName} provider=${provider} participant=${track.participantIdentity} error=${message}`
+      );
       errors.push(`${track.trackId}: ${message}`);
     }
   }
@@ -1498,29 +1584,52 @@ async function runRoomTranscriptionJob(
         : "failed";
 
   if (trackArtifacts.length > 0) {
-    await writeJsonToS3(
-      outputKeys.finalTranscript,
-      buildMeetingTranscript(roomName, trackArtifacts, sourceFiles)
+    const meetingTranscript = buildMeetingTranscript(
+      roomName,
+      trackArtifacts,
+      sourceFiles,
+      providerModel
     );
+    await writeJsonToS3(providerOutputKeys.finalTranscript, meetingTranscript);
+
+    if (provider === defaultProvider) {
+      await writeJsonToS3(outputKeys.finalTranscript, meetingTranscript);
+    }
   }
 
-  await writeJsonToS3(outputKeys.manifest, {
+  const manifest: TranscriptionManifest = {
     room_name: roomName,
     trigger,
+    provider,
+    provider_model: providerModel,
     status,
     generated_at: new Date().toISOString(),
-    output_keys: outputKeys,
+    output_keys: providerOutputKeys,
     canonical_output_keys: canonicalized.canonicalOutputKeys,
     source_files: sourceFiles,
     processed_tracks: trackArtifacts.length,
     failed_tracks: tracks.length - trackArtifacts.length,
     errors,
-  } as TranscriptionManifest);
+  };
+  await writeJsonToS3(providerOutputKeys.manifest, manifest);
+  if (provider === defaultProvider) {
+    await writeJsonToS3(outputKeys.manifest, {
+      ...manifest,
+      output_keys: outputKeys,
+    } satisfies TranscriptionManifest);
+  }
+
+  console.log(
+    `[transcription:job:done] room=${roomName} trigger=${trigger} provider=${provider} status=${status} processed_tracks=${trackArtifacts.length} failed_tracks=${tracks.length - trackArtifacts.length}`
+  );
 
   return {
     roomName,
     trigger,
+    provider,
+    providerModel,
     outputKeys,
+    providerOutputKeys,
     canonicalOutputKeys: canonicalized.canonicalOutputKeys,
     status,
     processedTracks: trackArtifacts.length,
@@ -1534,20 +1643,31 @@ export async function queueRoomTranscription(
   options: QueueRoomTranscriptionOptions
 ): Promise<QueueRoomTranscriptionResult> {
   const { roomName, prefix, force = false, trigger } = options;
+  const provider = resolveTranscriptionProviderName(options.provider);
   const outputKeys = getOutputKeys(roomName, prefix);
-  const roomKey = `${roomName}:${prefix || ""}`;
+  const providerOutputKeys = getProviderOutputKeys(roomName, provider, prefix);
+  const roomKey = `${roomName}:${prefix || ""}:${provider}`;
 
   if (roomJobs.has(roomKey)) {
+    console.log(
+      `[transcription:queue] room=${roomName} provider=${provider} status=already_running`
+    );
     return {
       status: "already_running",
       roomName,
       trigger,
+      provider,
       outputKeys,
+      providerOutputKeys,
       canonicalOutputKeys: [],
       force,
       reason: "A transcription job is already running for this room",
     };
   }
+
+  console.log(
+    `[transcription:queue] room=${roomName} provider=${provider} status=accepted trigger=${trigger} force=${force}`
+  );
 
   const job = runRoomTranscriptionJob(options)
     .catch((error) => {
@@ -1564,7 +1684,9 @@ export async function queueRoomTranscription(
     status: "accepted",
     roomName,
     trigger,
+    provider,
     outputKeys,
+    providerOutputKeys,
     canonicalOutputKeys: [],
     force,
   };
@@ -1572,8 +1694,11 @@ export async function queueRoomTranscription(
 
 export async function estimateRoomTranscriptionCost(
   roomName: string,
-  prefix?: string
+  prefix?: string,
+  providerInput?: string
 ): Promise<RoomTranscriptionCostEstimate> {
+  const provider = resolveTranscriptionProviderName(providerInput);
+  const transcriptionModel = getTranscriptionProvider(provider).getModel();
   await canonicalizeRoomParticipants(roomName, prefix, false);
   const canonicalParticipants = await discoverCanonicalParticipants(roomName, prefix);
 
@@ -1616,16 +1741,21 @@ export async function estimateRoomTranscriptionCost(
     0
   );
   const translationCost = Number((transcriptionCost * 0.03).toFixed(6));
+  const pricingUnavailable = provider !== "openai";
+  const warnings = canonicalParticipants
+    .filter((participant) => participant.durationMs === 0)
+    .map((participant) => `Missing duration metadata for ${participant.participantIdentity}`);
 
   return {
     room_name: roomName,
     prefix: getRoomPrefix(roomName, prefix),
+    provider,
     models: {
-      transcription: DEFAULT_TRANSCRIPTION_MODEL,
+      transcription: transcriptionModel,
       translation: DEFAULT_TRANSLATION_MODEL,
     },
     pricing: {
-      transcription_usd_per_minute: pricing.transcriptionUsdPerMinute,
+      transcription_usd_per_minute: pricingUnavailable ? 0 : pricing.transcriptionUsdPerMinute,
       translation_input_usd_per_1m_tokens:
         pricing.translationInputUsdPer1MTokens,
       translation_output_usd_per_1m_tokens:
@@ -1634,13 +1764,24 @@ export async function estimateRoomTranscriptionCost(
     totals: {
       tracks: estimatedTracks.length,
       total_audio_minutes: Number(totalMinutes.toFixed(2)),
-      estimated_transcription_cost_usd: Number(transcriptionCost.toFixed(6)),
+      estimated_transcription_cost_usd: pricingUnavailable ? 0 : Number(transcriptionCost.toFixed(6)),
       estimated_translation_cost_usd: translationCost,
-      estimated_total_cost_usd: Number((transcriptionCost + translationCost).toFixed(6)),
+      estimated_total_cost_usd: Number(
+        ((pricingUnavailable ? 0 : transcriptionCost) + translationCost).toFixed(6)
+      ),
     },
-    tracks: estimatedTracks,
-    warnings: canonicalParticipants
-      .filter((participant) => participant.durationMs === 0)
-      .map((participant) => `Missing duration metadata for ${participant.participantIdentity}`),
+    tracks: estimatedTracks.map((track) => ({
+      ...track,
+      estimated_transcription_cost_usd: pricingUnavailable
+        ? null
+        : track.estimated_transcription_cost_usd,
+    })),
+    warnings: pricingUnavailable
+      ? [
+          ...warnings,
+          `Pricing estimate is currently unavailable for provider '${provider}'.`,
+        ]
+      : warnings,
+    pricing_unavailable: pricingUnavailable,
   };
 }

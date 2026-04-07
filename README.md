@@ -1,6 +1,6 @@
 # LiveKit Meeting App
 
-Self-hosted video meetings with automatic per-participant audio recording, canonical participant audio in S3, and OpenAI-powered transcription. Built with Next.js 14, LiveKit, and Docker.
+Self-hosted video meetings with automatic per-participant audio recording, canonical participant audio in S3, and provider-swappable transcription. Built with Next.js 14, LiveKit, and Docker.
 
 ---
 
@@ -13,7 +13,7 @@ Self-hosted video meetings with automatic per-participant audio recording, canon
 - Metered.ca TURN — hosted TURN relay for guests behind NAT/firewall
 - AWS S3 — stores recordings and transcripts
 - ffmpeg — canonical audio merge, preprocessing, and VAD-style speech window detection
-- OpenAI Whisper — audio transcription
+- OpenAI Whisper or Mistral Voxtral — audio transcription
 - GPT-4o-mini — translation and language detection
 
 ---
@@ -39,7 +39,7 @@ Recording flow:
 Transcription flow:
 1. Canonical participant audio is normalized with `ffmpeg`
 2. VAD-style speech windows are detected with `ffmpeg silencedetect`
-3. Only voiced windows are chunked into ~45s segments and sent to OpenAI Whisper
+3. Only voiced windows are chunked into ~45s segments and sent to the selected transcription provider
 4. Utterances are translated to English via GPT-4o-mini (batched, 50 at a time)
 5. A merged meeting transcript and manifest are written to S3
 
@@ -62,6 +62,13 @@ S3 storage layout:
         └── _transcripts/
             ├── meeting_transcript.en.json
             └── manifest.json
+            └── providers/
+                ├── openai/
+                │   ├── meeting_transcript.en.json
+                │   └── manifest.json
+                └── voxtral/
+                    ├── meeting_transcript.en.json
+                    └── manifest.json
 ```
 
 ---
@@ -76,6 +83,7 @@ S3 storage layout:
 - Two ngrok tunnels running
 - Metered.ca account (free tier) for TURN credentials
 - OpenAI API key
+- Mistral API key if you want to test Voxtral
 
 ### 2. Config files
 
@@ -114,8 +122,12 @@ S3_BUCKET=your_bucket_name
 NEXT_PUBLIC_LIVEKIT_URL=wss://your-ngrok-7880-url
 
 OPENAI_API_KEY=your_openai_key
+TRANSCRIPTION_PROVIDER=openai
 OPENAI_TRANSCRIPTION_MODEL=whisper-1
 OPENAI_TRANSLATION_MODEL=gpt-4o-mini
+MISTRAL_API_KEY=your_mistral_key
+MISTRAL_TRANSCRIPTION_MODEL=voxtral-mini-latest
+MISTRAL_TRANSCRIPTION_DIARIZE=false
 
 # Optional transcription tuning
 WHISPER_CHUNK_SECONDS=45
@@ -192,8 +204,8 @@ The IAM user needs this policy on your S3 bucket:
 | POST | `/api/token` | Generate LiveKit room token |
 | POST | `/api/egress/start` | Start per-participant track recording |
 | POST | `/api/egress/stop` | Stop recording and write metadata |
-| POST | `/api/transcription/run` | Trigger transcription for a room |
-| GET  | `/api/transcription/estimate` | Estimate transcription cost |
+| POST | `/api/transcription/run` | Trigger transcription for a room, optionally with a provider override |
+| POST | `/api/transcription/estimate` | Estimate transcription cost for a room and provider |
 
 ---
 
@@ -206,6 +218,14 @@ Canonical participant files:
 Room transcript files:
 - `recordings/<room-name>/_transcripts/meeting_transcript.en.json`
 - `recordings/<room-name>/_transcripts/manifest.json`
+- `recordings/<room-name>/_transcripts/providers/openai/meeting_transcript.en.json`
+- `recordings/<room-name>/_transcripts/providers/openai/manifest.json`
+- `recordings/<room-name>/_transcripts/providers/voxtral/meeting_transcript.en.json`
+- `recordings/<room-name>/_transcripts/providers/voxtral/manifest.json`
+
+Provider behavior:
+- the configured default provider also writes the legacy top-level `_transcripts/meeting_transcript.en.json`
+- manual provider tests always write provider-scoped outputs, so OpenAI and Voxtral can be compared side by side
 
 `meeting_transcript.en.json` includes:
 - `speakers` with stable `identity` and `display_name`
@@ -219,6 +239,15 @@ curl -X POST http://localhost:3000/api/transcription/run \
   -H "Content-Type: application/json" \
   -H "Authorization: Bearer <app-jwt>" \
   -d '{"roomName":"meet-xxxx-yyyy","force":true}'
+```
+
+To run a provider-specific comparison:
+
+```bash
+curl -X POST http://localhost:3000/api/transcription/run \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer <app-jwt>" \
+  -d '{"roomName":"meet-xxxx-yyyy","force":true,"provider":"voxtral"}'
 ```
 
 ---
