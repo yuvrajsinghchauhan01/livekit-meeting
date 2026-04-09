@@ -1273,8 +1273,17 @@ function isLikelyNoiseUtterance(utterance: TrackUtterance) {
   return false;
 }
 
+// Cyrillic, Arabic, CJK, Greek, Hebrew — none expected in a Hindi-English meeting
+const HALLUCINATED_SCRIPT_RE = /[\u0400-\u04FF\u0600-\u06FF\u4E00-\u9FFF\u0370-\u03FF\u0590-\u05FF]/;
+
+function isScriptHallucination(utterance: TrackUtterance) {
+  return HALLUCINATED_SCRIPT_RE.test(utterance.original_text);
+}
+
 function filterNoiseUtterances(utterances: TrackUtterance[]) {
-  return utterances.filter((utterance) => !isLikelyNoiseUtterance(utterance));
+  return utterances.filter(
+    (utterance) => !isLikelyNoiseUtterance(utterance) && !isScriptHallucination(utterance)
+  );
 }
 
 async function createTrackTranscript(
