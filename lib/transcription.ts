@@ -3,6 +3,7 @@ import { promisify } from "util";
 import { tmpdir } from "os";
 import { join } from "path";
 import { mkdtemp, readFile, rm, writeFile } from "fs/promises";
+import { NonRealTimeVAD } from "@ricky0123/vad-node";
 import {
   GetObjectCommand,
   HeadObjectCommand,
@@ -32,13 +33,15 @@ const CANONICAL_METADATA_NAME = "metadata.json";
 const WHISPER_CHUNK_SECONDS = Number(
   process.env.WHISPER_CHUNK_SECONDS || "45"
 );
-const VAD_SILENCE_NOISE = process.env.VAD_SILENCE_NOISE || "-35dB";
-const VAD_MIN_SILENCE_SECONDS = Number(
-  process.env.VAD_MIN_SILENCE_SECONDS || "0.6"
-);
 const VAD_MIN_SPEECH_MS = Number(process.env.VAD_MIN_SPEECH_MS || "400");
 const VAD_PADDING_MS = Number(process.env.VAD_PADDING_MS || "200");
 const VAD_MERGE_GAP_MS = Number(process.env.VAD_MERGE_GAP_MS || "700");
+const VAD_POSITIVE_SPEECH_THRESHOLD = Number(
+  process.env.VAD_POSITIVE_SPEECH_THRESHOLD || "0.5"
+);
+const VAD_NEGATIVE_SPEECH_THRESHOLD = Number(
+  process.env.VAD_NEGATIVE_SPEECH_THRESHOLD || "0.35"
+);
 const NOISE_MIN_CONFIDENCE = Number(
   process.env.NOISE_MIN_CONFIDENCE || "0.52"
 );
@@ -796,17 +799,6 @@ function mapCanonicalMsToAbsolute(
   return segment.started_at + Math.min(offsetMs, segment.duration_ms);
 }
 
-function parseTimestampToMs(value: string) {
-  const match = value.match(/(\d+):(\d+):([\d.]+)/);
-  if (!match) return null;
-
-  const hours = Number(match[1]);
-  const minutes = Number(match[2]);
-  const seconds = Number(match[3]);
-  if (![hours, minutes, seconds].every(Number.isFinite)) return null;
-
-  return Math.round(((hours * 60 + minutes) * 60 + seconds) * 1000);
-}
 
 function normalizeSpeechWindows(
   windows: SpeechWindow[],
@@ -838,47 +830,6 @@ function normalizeSpeechWindows(
   return merged;
 }
 
-function extractSpeechWindowsFromSilenceLog(output: string): SpeechWindow[] {
-  const durationMatch = output.match(/Duration:\s*(\d+:\d+:\d+(?:\.\d+)?)/);
-  const totalDurationMs = durationMatch
-    ? parseTimestampToMs(durationMatch[1]) || 0
-    : 0;
-
-  const silenceStarts = Array.from(
-    output.matchAll(/silence_start:\s*([\d.]+)/g),
-    (match) => Math.round(Number(match[1]) * 1000)
-  ).filter(Number.isFinite);
-  const silenceEnds = Array.from(
-    output.matchAll(/silence_end:\s*([\d.]+)/g),
-    (match) => Math.round(Number(match[1]) * 1000)
-  ).filter(Number.isFinite);
-
-  if (totalDurationMs <= 0) return [];
-  if (silenceStarts.length === 0 && silenceEnds.length === 0) {
-    return [{ startMs: 0, endMs: totalDurationMs }];
-  }
-
-  const windows: SpeechWindow[] = [];
-  let cursorMs = 0;
-
-  for (let index = 0; index < silenceStarts.length; index += 1) {
-    const silenceStartMs = Math.max(cursorMs, silenceStarts[index]);
-    const silenceEndMs = Math.max(silenceStartMs, silenceEnds[index] ?? silenceStartMs);
-
-    if (silenceStartMs - cursorMs >= VAD_MIN_SPEECH_MS) {
-      windows.push({ startMs: cursorMs, endMs: silenceStartMs });
-    }
-
-    cursorMs = silenceEndMs;
-  }
-
-  if (totalDurationMs - cursorMs >= VAD_MIN_SPEECH_MS) {
-    windows.push({ startMs: cursorMs, endMs: totalDurationMs });
-  }
-
-  return normalizeSpeechWindows(windows, totalDurationMs);
-}
-
 async function normalizeAudioFile(inputPath: string, normalizedPath: string) {
   await execFileAsync(
     "/opt/homebrew/bin/ffmpeg",
@@ -900,24 +851,43 @@ async function normalizeAudioFile(inputPath: string, normalizedPath: string) {
 }
 
 async function detectSpeechWindows(normalizedPath: string) {
-  const { stderr } = await execFileAsync(
+  // Get duration via ffprobe
+  const { stdout } = await execFileAsync(
+    "/opt/homebrew/bin/ffprobe",
+    ["-v", "error", "-show_entries", "format=duration", "-of", "csv=p=0", normalizedPath],
+    { maxBuffer: 1 * 1024 * 1024 }
+  );
+  const totalDurationMs = Math.round(Number(stdout.trim()) * 1000);
+
+  // Extract raw 16kHz mono float32 PCM to a temp file then read it
+  const pcmPath = normalizedPath.replace(/\.wav$/, ".pcm");
+  await execFileAsync(
     "/opt/homebrew/bin/ffmpeg",
-    [
-      "-i",
-      normalizedPath,
-      "-af",
-      `silencedetect=noise=${VAD_SILENCE_NOISE}:d=${VAD_MIN_SILENCE_SECONDS}`,
-      "-f",
-      "null",
-      "-",
-    ],
+    ["-y", "-i", normalizedPath, "-f", "f32le", "-ar", "16000", "-ac", "1", pcmPath],
     { maxBuffer: 10 * 1024 * 1024 }
   );
+  const pcmBuffer = await readFile(pcmPath);
+  await rm(pcmPath, { force: true });
 
-  const durationMatch = stderr.match(/Duration:\s*(\d+:\d+:\d+(?:\.\d+)?)/);
+  const float32 = new Float32Array(
+    pcmBuffer.buffer,
+    pcmBuffer.byteOffset,
+    pcmBuffer.byteLength / 4
+  );
+
+  const vadInstance = await NonRealTimeVAD.new({
+    positiveSpeechThreshold: VAD_POSITIVE_SPEECH_THRESHOLD,
+    negativeSpeechThreshold: VAD_NEGATIVE_SPEECH_THRESHOLD,
+  });
+
+  const rawWindows: SpeechWindow[] = [];
+  for await (const { start, end } of vadInstance.run(float32, 16000)) {
+    rawWindows.push({ startMs: Math.round(start), endMs: Math.round(end) });
+  }
+
   return {
-    totalDurationMs: durationMatch ? parseTimestampToMs(durationMatch[1]) || 0 : 0,
-    speechWindows: extractSpeechWindowsFromSilenceLog(stderr),
+    totalDurationMs,
+    speechWindows: normalizeSpeechWindows(rawWindows, totalDurationMs),
   };
 }
 
