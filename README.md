@@ -12,7 +12,7 @@ Self-hosted video meetings with automatic per-participant audio recording and tr
 | LiveKit (Docker) | WebRTC signaling and media server |
 | LiveKit Egress (Docker) | Records each participant's audio track as `.ogg` → S3 |
 | Redis (Docker) | LiveKit session/room state |
-| Metered.ca TURN | Hosted TURN relay for guests behind NAT/firewall |
+| coturn (AWS EC2) | Self-hosted TURN relay for guests behind NAT/firewall |
 | AWS S3 | Stores recordings and transcripts |
 | ffmpeg | Audio normalization and canonical merge |
 | Silero VAD (`@ricky0123/vad-node`) | Neural voice activity detection for speech windowing |
@@ -32,7 +32,7 @@ Two ngrok tunnels expose the app from your local machine:
 | ngrok #1 | 3000 | Next.js app — share this URL with guests |
 | ngrok #2 | 7880 | LiveKit signaling (WebSocket) |
 
-Media flows through Metered.ca TURN servers — no UDP ports need to be opened locally.
+Media flows through a self-hosted coturn TURN server on AWS EC2 — no UDP ports need to be opened locally.
 
 ### Recording flow
 
@@ -95,8 +95,8 @@ The default provider (set via `TRANSCRIPTION_PROVIDER`) also writes the top-leve
 - Node.js 18+
 - ffmpeg installed locally (`brew install ffmpeg` on macOS)
 - AWS S3 bucket with an IAM user
+- AWS EC2 t3.micro instance running coturn (see [TURN Server Setup](#turn-server-setup) below)
 - Two ngrok tunnels
-- Metered.ca account (free tier) for TURN credentials
 - OpenAI API key
 - Mistral API key (if using Voxtral)
 
@@ -113,7 +113,7 @@ Fill in `egress.yaml`:
 
 Fill in `livekit.yaml`:
 - `keys` — your API key/secret pair
-- `turn_servers` — Metered.ca username and credential
+- `turn_servers` — your coturn server IP, username, and password (see [TURN Server Setup](#turn-server-setup))
 
 ### 2. Environment variables
 
@@ -284,11 +284,133 @@ curl -X POST http://localhost:3000/api/transcription/run \
 
 ---
 
+## TURN Server Setup
+
+This app uses a self-hosted [coturn](https://github.com/coturn/coturn) server on an AWS EC2 t3.micro instance (free tier eligible) as the TURN relay. TURN is required for guests behind strict NAT, firewalls, or mobile networks where direct peer-to-peer WebRTC fails.
+
+### 1. Launch EC2 Instance
+
+1. Go to **AWS Console → EC2 → Launch Instance**
+2. Settings:
+   - **AMI**: Ubuntu Server 22.04 LTS
+   - **Instance type**: `t3.micro`
+   - **Key pair**: Create and download a `.pem` file
+   - **Auto-assign public IP**: Enabled
+
+### 2. Configure Security Group
+
+Add these inbound rules:
+
+| Type | Protocol | Port | Source |
+|------|----------|------|--------|
+| SSH | TCP | 22 | My IP |
+| Custom UDP | UDP | 3478 | 0.0.0.0/0 |
+| Custom TCP | TCP | 3478 | 0.0.0.0/0 |
+| Custom TCP | TCP | 443 | 0.0.0.0/0 |
+| Custom UDP | UDP | 5349 | 0.0.0.0/0 |
+| Custom TCP | TCP | 5349 | 0.0.0.0/0 |
+| Custom UDP | UDP | 49152-65535 | 0.0.0.0/0 |
+
+> **Tip:** Allocate an **Elastic IP** and attach it to the instance so the IP doesn't change on stop/start.
+
+### 3. Connect to the Instance
+
+Use **EC2 Instance Connect** (browser terminal) from the AWS console — go to your instance, click **Connect → EC2 Instance Connect → Connect**. This works even if your ISP blocks port 22.
+
+### 4. Install and Configure coturn
+
+```bash
+sudo apt update
+sudo apt install -y coturn
+```
+
+Enable the daemon:
+```bash
+sudo nano /etc/default/coturn
+# Uncomment: TURNSERVER_ENABLED=1
+```
+
+Create the config:
+```bash
+sudo nano /etc/turnserver.conf
+```
+
+Paste this (replace values):
+```conf
+listening-port=3478
+alt-listening-port=443
+tls-listening-port=5349
+external-ip=YOUR_EC2_PUBLIC_IP
+
+realm=coturn.local
+user=YOUR_TURN_USERNAME:YOUR_TURN_PASSWORD
+lt-cred-mech
+fingerprint
+
+min-port=49152
+max-port=65535
+
+no-multicast-peers
+denied-peer-ip=0.0.0.0-0.255.255.255
+denied-peer-ip=10.0.0.0-10.255.255.255
+denied-peer-ip=127.0.0.0-127.255.255.255
+denied-peer-ip=172.16.0.0-172.31.255.255
+denied-peer-ip=192.168.0.0-192.168.255.255
+
+log-file=/var/log/turnserver.log
+```
+
+Start coturn:
+```bash
+sudo systemctl enable coturn
+sudo systemctl start coturn
+sudo systemctl status coturn   # should show active (running)
+```
+
+### 5. Verify TURN is Working
+
+Go to [Trickle ICE](https://webrtc.github.io/samples/src/content/peerconnection/trickle-ice/) and enter:
+
+- **URI**: `turn:YOUR_EC2_PUBLIC_IP:3478`
+- **Username**: your turn username
+- **Password**: your turn password
+
+Click **Gather candidates** — you must see a `relay` type candidate. If you do, TURN is working.
+
+### 6. Update livekit.yaml
+
+```yaml
+turn_servers:
+  - host: YOUR_EC2_PUBLIC_IP
+    port: 3478
+    protocol: udp
+    username: YOUR_TURN_USERNAME
+    credential: YOUR_TURN_PASSWORD
+  - host: YOUR_EC2_PUBLIC_IP
+    port: 3478
+    protocol: tcp
+    username: YOUR_TURN_USERNAME
+    credential: YOUR_TURN_PASSWORD
+  - host: YOUR_EC2_PUBLIC_IP
+    port: 443
+    protocol: tcp
+    username: YOUR_TURN_USERNAME
+    credential: YOUR_TURN_PASSWORD
+```
+
+Then restart Docker:
+```bash
+docker compose down
+docker compose up -d
+```
+
+---
+
 ## Troubleshooting
 
 | Problem | Fix |
 |---------|-----|
-| Guest sees black screen / disconnects | TURN not working — verify Metered credentials in `livekit.yaml` |
+| Guest sees black screen / disconnects | TURN not working — verify coturn is running (`sudo systemctl status coturn`) and credentials in `livekit.yaml` match `turnserver.conf` |
 | Recording not appearing in S3 | Check AWS credentials in `egress.yaml` and IAM permissions |
 | `Failed to start recording` | Ensure `livekit-egress` container is running (`docker compose ps`) |
 | Auto-transcription didn't fire | Session ended abnormally — run transcription manually with `force: true` |
@@ -304,4 +426,4 @@ curl -X POST http://localhost:3000/api/transcription/run \
 
 - `egress.yaml`, `livekit.yaml`, and `.env.local` are gitignored — never commit them
 - Use the `.example` files to share config structure without secrets
-- If secrets are accidentally pushed, rotate them immediately in AWS IAM and the Metered dashboard
+- If secrets are accidentally pushed, rotate them immediately in AWS IAM and update `turnserver.conf` on your EC2 instance

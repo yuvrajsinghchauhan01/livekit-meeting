@@ -8,16 +8,21 @@ rtc:
   stun_servers:
     - stun.l.google.com:19302
   turn_servers:
-    - host: global.relay.metered.ca
-      port: 80
+    - host: YOUR_COTURN_SERVER_IP
+      port: 3478
       protocol: udp
-      username: YOUR_METERED_USERNAME
-      credential: YOUR_METERED_CREDENTIAL
-    - host: global.relay.metered.ca
-      port: 80
+      username: YOUR_TURN_USERNAME
+      credential: YOUR_TURN_PASSWORD
+    - host: YOUR_COTURN_SERVER_IP
+      port: 3478
       protocol: tcp
-      username: YOUR_METERED_USERNAME
-      credential: YOUR_METERED_CREDENTIAL
+      username: YOUR_TURN_USERNAME
+      credential: YOUR_TURN_PASSWORD
+    - host: YOUR_COTURN_SERVER_IP
+      port: 443
+      protocol: tcp
+      username: YOUR_TURN_USERNAME
+      credential: YOUR_TURN_PASSWORD
 
 redis:
   address: redis:6379
