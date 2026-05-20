@@ -22,10 +22,10 @@ function RoomInner({ roomName, identity, displayName, appToken, onLeave }: {
   roomName: string; identity: string; displayName: string; appToken: string; onLeave: () => void;
 }) {
   const participants = useParticipants();
-  const stopRecordingRef = useRef<() => void>(() => {});
+  const stopRecordingRef = useRef<() => Promise<void>>(() => Promise.resolve());
 
-  function handleLeave() {
-    stopRecordingRef.current(); // stop egress before leaving
+  async function handleLeave() {
+    await stopRecordingRef.current(); // wait for egress stop to complete before navigating
     onLeave();
   }
 
@@ -35,11 +35,7 @@ function RoomInner({ roomName, identity, displayName, appToken, onLeave }: {
                          bg-slate-800 border-b border-slate-700 shrink-0 z-10">
         <div className="flex items-center gap-3">
           <div className="w-8 h-8 bg-indigo-600 rounded-lg flex items-center justify-center">
-            <svg className="w-5 h-5 text-white" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2}
-                d="M15 10l4.553-2.069A1 1 0 0121 8.82v6.36a1 1 0 01-1.447.894L15
-                   14M3 8a2 2 0 012-2h8a2 2 0 012 2v8a2 2 0 01-2 2H5a2 2 0 01-2-2V8z" />
-            </svg>
+            <span className="text-white font-bold text-xs tracking-tight">MI</span>
           </div>
           <div>
             <h1 className="font-semibold text-white text-sm">{roomName}</h1>

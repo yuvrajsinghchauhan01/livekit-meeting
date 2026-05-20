@@ -4,6 +4,69 @@ import { EgressClient } from "livekit-server-sdk";
 import { S3Client, PutObjectCommand, HeadObjectCommand } from "@aws-sdk/client-s3";
 import { getAppMetadataKey, queueRoomTranscription } from "@/lib/transcription";
 
+// How long to wait before force-stopping stuck egress and triggering transcription
+const STUCK_EGRESS_TIMEOUT_MS = Number(process.env.STUCK_EGRESS_TIMEOUT_MS || "30000");
+
+// Track rooms where a fallback timer is already scheduled
+const pendingFallbacks = new Set<string>();
+
+/**
+ * Called when active egress > 0 after a participant leaves.
+ * Waits STUCK_EGRESS_TIMEOUT_MS, then force-stops any remaining active egress
+ * and triggers transcription — handles browsers that crash without calling stop.
+ */
+function scheduleStuckEgressFallback(roomName: string, egressClient: EgressClient) {
+  if (pendingFallbacks.has(roomName)) {
+    console.log(`[egress:fallback] timer already pending room=${roomName}`);
+    return;
+  }
+
+  pendingFallbacks.add(roomName);
+  console.log(
+    `[egress:fallback] scheduling stuck-egress check room=${roomName} delay=${STUCK_EGRESS_TIMEOUT_MS}ms`
+  );
+
+  setTimeout(async () => {
+    pendingFallbacks.delete(roomName);
+    try {
+      const activeEgress = await egressClient.listEgress({ roomName, active: true });
+      console.log(
+        `[egress:fallback] check room=${roomName} active=${activeEgress.length}`
+      );
+
+      if (activeEgress.length === 0) {
+        console.log(`[egress:fallback] no stuck egress found room=${roomName}`);
+        return;
+      }
+
+      // Force-stop all remaining stuck egress
+      console.log(
+        `[egress:fallback] force-stopping ${activeEgress.length} stuck egress room=${roomName}`
+      );
+      await Promise.allSettled(
+        activeEgress.map((eg) =>
+          egressClient.stopEgress(eg.egressId).catch((err) => {
+            console.error(
+              `[egress:fallback] failed to stop egress=${eg.egressId} room=${roomName}:`,
+              err
+            );
+          })
+        )
+      );
+
+      // Trigger transcription now that all egress are stopped
+      console.log(
+        `[egress:fallback] queueing transcription after force-stop room=${roomName}`
+      );
+      void queueRoomTranscription({ roomName, trigger: "automatic" }).catch((err) => {
+        console.error(`[egress:fallback] transcription queue failed room=${roomName}:`, err);
+      });
+    } catch (err) {
+      console.error(`[egress:fallback] error room=${roomName}:`, err);
+    }
+  }, STUCK_EGRESS_TIMEOUT_MS);
+}
+
 export async function POST(req: NextRequest) {
   let body: Record<string, unknown>;
   try {
@@ -38,7 +101,25 @@ export async function POST(req: NextRequest) {
   );
 
   try {
-    const egressInfo = await egressClient.stopEgress(egressId);
+    let egressInfo;
+    try {
+      egressInfo = await egressClient.stopEgress(egressId);
+    } catch (stopErr: unknown) {
+      // Egress already completed on its own (e.g. participant disconnected) — treat as success
+      const isAlreadyDone =
+        stopErr instanceof Error &&
+        (stopErr.message.includes("EGRESS_COMPLETE") ||
+          stopErr.message.includes("failed_precondition") ||
+          (stopErr as { code?: string }).code === "failed_precondition");
+
+      if (!isAlreadyDone) throw stopErr;
+
+      console.log(
+        `[egress:stop] egress=${egressId} already completed, treating as clean stop room=${roomName || "unknown"}`
+      );
+      egressInfo = { status: 3 }; // EGRESS_COMPLETE = 3
+    }
+
     const stoppedAt = Date.now();
     console.log(
       `[egress:stop] stopped egress=${egressId} room=${roomName || "unknown"} participant=${participantIdentity || "unknown"} track=${trackSid || "unknown"} status=${egressInfo.status}`
@@ -123,6 +204,8 @@ export async function POST(req: NextRequest) {
           console.log(
             `[egress:stop] not queueing transcription yet room=${roomName} active_egress_remaining=${activeEgress.length}`
           );
+          // Schedule a fallback in case remaining egress are stuck (crashed browsers)
+          scheduleStuckEgressFallback(roomName, egressClient);
         }
       } catch (err) {
         console.error(`Failed to check active egress for ${roomName}:`, err);

@@ -1,4 +1,4 @@
-# LiveKit Meeting App
+# MI Meet
 
 Self-hosted video meetings with automatic per-participant audio recording and transcription. Built with Next.js 14, LiveKit, and Docker.
 
@@ -71,6 +71,7 @@ If a session ends abnormally (browser crash, network drop), the last egress may 
         │   └── metadata.json           ← canonical participant metadata
         └── _transcripts/
             ├── meeting_transcript.en.json   ← default provider output
+            ├── meeting_minutes.json         ← summary, key points, action items
             ├── manifest.json
             └── providers/
                 ├── openai/
@@ -80,6 +81,8 @@ If a session ends abnormally (browser crash, network drop), the last egress may 
                     ├── meeting_transcript.en.json
                     └── manifest.json
 ```
+
+`meeting_minutes.json` is auto-generated after transcription completes (default provider only).
 
 `TR_*`, `EG_*`, and `APP_*` are internal artifacts. The user-facing outputs are `audio.ogg`, `metadata.json`, and everything under `_transcripts/`.
 
@@ -217,6 +220,7 @@ Open [http://localhost:3000](http://localhost:3000) or share the ngrok 3000 URL 
 | POST | `/api/egress/stop` | JWT | Stop recording, write metadata, auto-queue transcription |
 | POST | `/api/transcription/run` | JWT | Manually trigger transcription for a room |
 | POST | `/api/transcription/estimate` | JWT | Estimate transcription cost for a room |
+| POST | `/api/meeting-minutes/generate` | JWT | Generate meeting minutes for a room |
 
 All authenticated routes accept the JWT as `Authorization: Bearer <token>` or as `appToken` in the request body.
 
@@ -281,6 +285,58 @@ curl -X POST http://localhost:3000/api/transcription/run \
 ```
 
 `start_ms` / `end_ms` are relative to the earliest participant's join time (wall-clock aligned across all speakers).
+
+## Meeting Minutes
+
+After transcription completes, meeting minutes are **automatically generated** using GPT-4o-mini and written to S3 at `_transcripts/meeting_minutes.json`.
+
+### Output format
+
+```json
+{
+  "room_name": "meet-xxxx-yyyy",
+  "generated_at": "...",
+  "model": "gpt-4o-mini",
+  "transcript_key": "recordings/meet-xxxx-yyyy/_transcripts/meeting_transcript.en.json",
+  "participants": ["Alice", "Bob"],
+  "duration_ms": 3600000,
+  "summary": "The team discussed Q3 roadmap priorities...",
+  "key_points": [
+    "Decided to prioritize the mobile app rewrite",
+    "Budget approved for new infrastructure"
+  ],
+  "action_items": [
+    "Alice will share the updated roadmap by Friday",
+    "Bob to schedule follow-up with the design team"
+  ]
+}
+```
+
+### Manual trigger
+
+If auto-generation didn't fire (e.g. transcription was run manually), trigger it explicitly:
+
+```bash
+curl -X POST http://localhost:3000/api/meeting-minutes/generate \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer <token>" \
+  -d '{"roomName":"meet-xxxx-yyyy"}'
+```
+
+Force regeneration even if minutes already exist:
+
+```bash
+curl -X POST http://localhost:3000/api/meeting-minutes/generate \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer <token>" \
+  -d '{"roomName":"meet-xxxx-yyyy","force":true}'
+```
+
+### Configuration
+
+| Env var | Default | Description |
+|---------|---------|-------------|
+| `OPENAI_MINUTES_MODEL` | `gpt-4o-mini` | Model used for minutes generation |
 
 ---
 

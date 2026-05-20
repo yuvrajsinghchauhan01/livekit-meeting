@@ -67,13 +67,10 @@ export default function HomePage() {
         <div className="bg-slate-800 rounded-2xl shadow-2xl p-8 border border-slate-700">
           <div className="flex items-center gap-3 mb-8">
             <div className="w-10 h-10 bg-indigo-600 rounded-xl flex items-center justify-center">
-              <svg className="w-6 h-6 text-white" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2}
-                  d="M15 10l4.553-2.069A1 1 0 0121 8.82v6.36a1 1 0 01-1.447.894L15 14M3 8a2 2 0 012-2h8a2 2 0 012 2v8a2 2 0 01-2 2H5a2 2 0 01-2-2V8z" />
-              </svg>
+              <span className="text-white font-bold text-sm tracking-tight">MI</span>
             </div>
             <div>
-              <h1 className="text-xl font-bold text-white">New Meeting</h1>
+              <h1 className="text-xl font-bold text-white">MI Meet</h1>
               <p className="text-slate-400 text-sm">Enter your name to get started</p>
             </div>
           </div>

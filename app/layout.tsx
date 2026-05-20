@@ -3,7 +3,7 @@ import "@livekit/components-styles";
 import "./globals.css";
 
 export const metadata: Metadata = {
-  title: "LiveKit Meeting",
+  title: "MI Meet",
   description: "Secure video meetings with per-participant recording",
 };
 

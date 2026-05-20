@@ -20,6 +20,7 @@ import {
   getTranscriptionProvider,
   resolveTranscriptionProviderName,
 } from "@/lib/transcription/providers";
+import { generateMeetingMinutes } from "@/lib/meeting-minutes";
 
 const execFileAsync = promisify(execFile);
 
@@ -1573,6 +1574,11 @@ async function runRoomTranscriptionJob(
 
     if (provider === defaultProvider) {
       await writeJsonToS3(outputKeys.finalTranscript, meetingTranscript);
+
+      // Auto-generate meeting minutes after the default transcript is written
+      void generateMeetingMinutes(roomName, { prefix, force }).catch((err) => {
+        console.error(`[meeting-minutes:auto-trigger] room=${roomName} error:`, err);
+      });
     }
   }
 

@@ -52,7 +52,7 @@ export default function RecordingControls({
   }
 
   function stopRecording() {
-    if (!egressId.current) return;
+    if (!egressId.current) return Promise.resolve();
 
     const payload = JSON.stringify({
       egressId:            egressId.current,
@@ -64,23 +64,17 @@ export default function RecordingControls({
       appToken,
     });
 
-    // sendBeacon works even during page unload
-    const sent = navigator.sendBeacon(
-      "/api/egress/stop",
-      new Blob([payload], { type: "application/json" })
-    );
-    if (!sent) {
-      fetch("/api/egress/stop", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: payload,
-        keepalive: true,
-      }).catch(console.error);
-    }
-
     egressId.current = null;
     started.current  = false;
     setRecording(false);
+
+    // keepalive: true survives page unload AND can be awaited — unlike sendBeacon
+    return fetch("/api/egress/stop", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: payload,
+      keepalive: true,
+    }).catch(console.error);
   }
 
   // Expose stopRecording to parent via ref so it can call it on leave
